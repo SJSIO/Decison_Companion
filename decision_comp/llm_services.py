@@ -43,7 +43,7 @@ class SynthesisOutput(StrictBaseModel):
     explanation: str = Field(..., min_length=1)
 
 
-def get_llm(model_name: str = "llama-3.1-8b-instant") -> ChatGroq:
+def get_llm(model_name: str = "llama-3.3-70b-versatile") -> ChatGroq:
     """
     Instantiate a ChatGroq LLM client.
     Raises a clear error if GROQ_API_KEY is not configured.
