@@ -89,6 +89,32 @@ class NormalizedTriangularFuzzyNumber(StrictBaseModel):
         return v
 
 
+class WeightedTriangularFuzzyNumber(StrictBaseModel):
+    """
+    Triangular fuzzy number used internally for weighted scores.
+    Values may exceed 1.0 after applying criterion weights; we only
+    enforce the usual ordering l <= m <= u.
+    """
+
+    l: float = Field(..., description="Lower bound of the weighted score.")
+    m: float = Field(..., description="Most-likely weighted score.")
+    u: float = Field(..., description="Upper bound of the weighted score.")
+
+    @validator("m")
+    def weighted_m_not_less_than_l(cls, v: float, values) -> float:
+        l = values.get("l")
+        if l is not None and v < l:
+            raise ValueError("For weighted TFNs, m must be greater than or equal to l.")
+        return v
+
+    @validator("u")
+    def weighted_u_not_less_than_m(cls, v: float, values) -> float:
+        m = values.get("m")
+        if m is not None and v < m:
+            raise ValueError("For weighted TFNs, u must be greater than or equal to m.")
+        return v
+
+
 class OptionCriterionScore(StrictBaseModel):
     option_name: str
     criterion_name: str

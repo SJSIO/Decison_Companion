@@ -15,6 +15,7 @@ from .models import (
     NormalizedTriangularFuzzyNumber,
     OptionCriterionScore,
     TriangularFuzzyNumber,
+    WeightedTriangularFuzzyNumber,
 )
 
 
@@ -56,9 +57,12 @@ def _normalize_fuzzy_matrix(
     final_scores: FinalScoresState,
 ) -> Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber]:
     """
-    Normalize the fuzzy decision matrix for benefit criteria.
-    For each criterion, divide each TFN (l, m, u) by the maximum upper bound u
-    across all options for that criterion, producing normalized TFNs in [0, 1].
+    Normalize the fuzzy decision matrix so all values lie in [0, 1].
+
+    - Benefit criteria: divide each TFN (l, m, u) by the maximum upper bound u
+      across all options for that criterion.
+    - Cost criteria: flip each TFN using the minimum lower bound, then scale
+      the flipped TFNs by their maximum upper bound so the result is in [0, 1].
     """
     normalized: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber] = {}
 
@@ -85,23 +89,37 @@ def _normalize_fuzzy_matrix(
                     u=tfn.u / max_u,
                 )
         else:
-            # Cost criterion: flip the scale using the minimum lower bound.
+            # Cost criterion: flip with min_l / TFN, then scale to [0, 1].
             min_l = min(t.l for t in tfn_by_option.values())
             if min_l <= 0.0:
                 raise ValueError(f"Minimum lower bound for cost criterion '{crit.name}' must be positive.")
 
+            flipped: Dict[str, Tuple[float, float, float]] = {}
             for opt in inputs.options:
                 tfn = tfn_by_option[opt.name]
-                # Guard against division by zero; if any component is non-positive, raise.
                 if tfn.l <= 0.0 or tfn.m <= 0.0 or tfn.u <= 0.0:
                     raise ValueError(
                         f"Cost criterion '{crit.name}' has non-positive TFN components "
-                        f"for option '{opt.name}', cannot normalize."
+                        f"for option '{opt.name}', cannot flip."
                     )
+                flipped[opt.name] = (
+                    min_l / tfn.u,
+                    min_l / tfn.m,
+                    min_l / tfn.l,
+                )
+
+            max_u_flipped = max(triple[2] for triple in flipped.values())
+            if max_u_flipped <= 0.0:
+                raise ValueError(
+                    f"Maximum flipped upper bound for cost criterion '{crit.name}' must be positive."
+                )
+
+            for opt in inputs.options:
+                fl, fm, fu = flipped[opt.name]
                 normalized[(opt.name, crit.name)] = NormalizedTriangularFuzzyNumber(
-                    l=min_l / tfn.u,
-                    m=min_l / tfn.m,
-                    u=min_l / tfn.l,
+                    l=fl / max_u_flipped,
+                    m=fm / max_u_flipped,
+                    u=fu / max_u_flipped,
                 )
 
     return normalized
@@ -110,11 +128,11 @@ def _normalize_fuzzy_matrix(
 def _apply_weights(
     normalized: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber],
     inputs: DecisionInputState,
-) -> Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber]:
+) -> Dict[Tuple[str, str], WeightedTriangularFuzzyNumber]:
     """
     Multiply each normalized TFN by the corresponding criterion's crisp weight.
     """
-    weighted: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber] = {}
+    weighted: Dict[Tuple[str, str], WeightedTriangularFuzzyNumber] = {}
 
     weight_by_criterion: Dict[str, int] = {c.name: c.weight for c in inputs.criteria}
 
@@ -123,7 +141,7 @@ def _apply_weights(
             key = (opt.name, crit.name)
             tfn = normalized[key]
             w = float(weight_by_criterion[crit.name])
-            weighted[key] = NormalizedTriangularFuzzyNumber(
+            weighted[key] = WeightedTriangularFuzzyNumber(
                 l=tfn.l * w,
                 m=tfn.m * w,
                 u=tfn.u * w,
@@ -133,16 +151,16 @@ def _apply_weights(
 
 
 def _compute_fpis_fnis(
-    weighted: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber],
+    weighted: Dict[Tuple[str, str], WeightedTriangularFuzzyNumber],
     inputs: DecisionInputState,
-) -> Tuple[Dict[str, NormalizedTriangularFuzzyNumber], Dict[str, NormalizedTriangularFuzzyNumber]]:
+) -> Tuple[Dict[str, WeightedTriangularFuzzyNumber], Dict[str, WeightedTriangularFuzzyNumber]]:
     """
     Compute the Fuzzy Positive Ideal Solution (FPIS) and
     Fuzzy Negative Ideal Solution (FNIS) per criterion in the
-    normalized fuzzy space.
+    weighted fuzzy space.
     """
-    fpis: Dict[str, NormalizedTriangularFuzzyNumber] = {}
-    fnis: Dict[str, NormalizedTriangularFuzzyNumber] = {}
+    fpis: Dict[str, WeightedTriangularFuzzyNumber] = {}
+    fnis: Dict[str, WeightedTriangularFuzzyNumber] = {}
 
     for crit in inputs.criteria:
         l_vals = []
@@ -155,12 +173,12 @@ def _compute_fpis_fnis(
             m_vals.append(tfn.m)
             u_vals.append(tfn.u)
 
-        fpis[crit.name] = NormalizedTriangularFuzzyNumber(
+        fpis[crit.name] = WeightedTriangularFuzzyNumber(
             l=max(l_vals),
             m=max(m_vals),
             u=max(u_vals),
         )
-        fnis[crit.name] = NormalizedTriangularFuzzyNumber(
+        fnis[crit.name] = WeightedTriangularFuzzyNumber(
             l=min(l_vals),
             m=min(m_vals),
             u=min(u_vals),
@@ -170,8 +188,8 @@ def _compute_fpis_fnis(
 
 
 def _distance_between_tfn(
-    a: NormalizedTriangularFuzzyNumber,
-    b: NormalizedTriangularFuzzyNumber,
+    a: WeightedTriangularFuzzyNumber,
+    b: WeightedTriangularFuzzyNumber,
 ) -> float:
     """
     Euclidean distance between two TFNs using the vertex method.
