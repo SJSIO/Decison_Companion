@@ -5,9 +5,9 @@ from typing import List
 
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field, PositiveInt, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from .models import DecisionInputState, WSMResult
+from .models import DecisionInputState, FuzzyTopsisResult, TriangularFuzzyNumber
 
 
 class StrictBaseModel(BaseModel):
@@ -25,7 +25,10 @@ class OptionCriterionAIResearch(StrictBaseModel):
 
     option_index: int = Field(..., ge=0, description="Zero-based index into the options list.")
     criterion_index: int = Field(..., ge=0, description="Zero-based index into the criteria list.")
-    score: PositiveInt = Field(..., ge=1, le=10, description="Score from 1 (worst) to 10 (best).")
+    score: TriangularFuzzyNumber = Field(
+        ...,
+        description="Triangular fuzzy score (l, m, u) representing worst-case, most-likely, and best-case values.",
+    )
     justification: str = Field(..., min_length=1)
 
     @field_validator("justification")
@@ -67,16 +70,20 @@ def get_llm(model_name: str = "llama-3.3-70b-versatile") -> ChatGroq:
 def run_research_llm(decision_input: DecisionInputState) -> ResearchBatchOutput:
     """
     Call the Groq Llama model to research each option against each criterion.
-    Returns a strictly validated ResearchBatchOutput.
+    Returns a strictly validated ResearchBatchOutput with fuzzy scores (TFNs).
     """
     llm = get_llm()
 
     system_prompt = (
         "You are an analytical assistant helping evaluate decision options. "
-        "For every combination of option and criterion, you must assign an integer "
-        "score from 1 (worst) to 10 (best) and provide a concise, factual, one-sentence justification. "
+        "For every combination of option and criterion, you must assign a TRIANGULAR FUZZY score "
+        "on a 1–10 scale and provide a concise, factual, one-sentence justification.\n\n"
+        "A triangular fuzzy score is represented as three floats (l, m, u) where:\n"
+        "- 1.0 <= l <= m <= u <= 10.0\n"
+        "- l is the worst-case score, m is the most-likely score, and u is the best-case score.\n"
         "Base your answers only on widely accepted facts and the descriptions provided. "
-        "If information is unclear, make a conservative, clearly justified estimate."
+        "If information is unclear, make a conservative, clearly justified estimate, and widen the "
+        "fuzzy range to reflect uncertainty."
     )
 
     # Flatten options and criteria into an explicit, index-based description
@@ -105,9 +112,18 @@ def run_research_llm(decision_input: DecisionInputState) -> ResearchBatchOutput:
         "For each item, you MUST output exactly:\n"
         "- option_index (integer, matching one of the listed option indices)\n"
         "- criterion_index (integer, matching one of the listed criterion indices)\n"
-        "- score (integer 1-10)\n"
-        "- justification (ONE factual sentence)\n"
-        "Do NOT rename options or criteria. Do NOT omit any combinations."
+        "- score: a triangular fuzzy score represented as three floats (l, m, u) on the 1–10 scale,\n"
+        "         where 1.0 <= l <= m <= u <= 10.0\n"
+        "- justification (ONE factual sentence)\n\n"
+        "Example item (for illustration only):\n"
+        "{\n"
+        '  \"option_index\": 0,\n'
+        '  \"criterion_index\": 1,\n'
+        '  \"score\": {\"l\": 7.0, \"m\": 8.0, \"u\": 9.0},\n'
+        '  \"justification\": \"Option 0 scores well on criterion 1 based on reliability and support.\"\n'
+        "}\n\n"
+        "Do NOT rename options or criteria. Do NOT omit any combinations. Ensure that you "
+        "respect the fuzzy score constraints for every item."
     )
 
     try:
@@ -151,22 +167,24 @@ def run_research_llm(decision_input: DecisionInputState) -> ResearchBatchOutput:
 
 def run_synthesis_llm(
     decision_input: DecisionInputState,
-    wsm_result: WSMResult,
+    topsis_result: FuzzyTopsisResult,
 ) -> SynthesisOutput:
     """
     Call the Groq Llama model to synthesize a short explanation of
-    why the winning option scored highest according to the math.
+    why the winning option achieved the highest Fuzzy TOPSIS closeness
+    coefficient, based on fuzzy scores and weights.
     """
     llm = get_llm()
 
     system_prompt = (
         "You are an explanation engine. You are given a decision problem, "
-        "options, criteria with weights, and the exact numeric results of a "
-        "Weighted Sum Model (WSM) calculation. Your job is to write a short, "
+        "options, criteria with weights, fuzzy scores (as triangular fuzzy numbers), "
+        "and the results of a Fuzzy TOPSIS calculation. Your job is to write a short, "
         "human-readable explanation (3-6 sentences) of exactly WHY the winner "
-        "won, grounded solely in the provided scores and weights.\n"
+        "won, grounded solely in the provided fuzzy scores, weights, and Fuzzy TOPSIS "
+        "closeness coefficients.\n"
         "Do NOT introduce new facts or speculation. Only refer to the math, "
-        "weights, and observed strengths/weaknesses implied by the numbers."
+        "weights, fuzzy ranges, and observed strengths/weaknesses implied by the numbers."
     )
 
     options_text = "\n".join(
@@ -180,13 +198,13 @@ def run_synthesis_llm(
     )
 
     breakdown_lines: List[str] = []
-    for opt in wsm_result.options:
-        breakdown_lines.append(f"Option {opt.option_name}: total score {opt.total_score}")
-        for contrib in opt.contributions:
-            breakdown_lines.append(
-                f"  - {contrib.criterion_name}: weight={contrib.weight}, "
-                f"score={contrib.score}, contribution={contrib.contribution}"
-            )
+    for opt_result in topsis_result.options:
+        breakdown_lines.append(
+            f"Option {opt_result.option_name}: "
+            f"distance_to_fpis={opt_result.distance_to_fpis:.4f}, "
+            f"distance_to_fnis={opt_result.distance_to_fnis:.4f}, "
+            f"closeness_coefficient={opt_result.closeness_coefficient:.4f}"
+        )
 
     breakdown_text = "\n".join(breakdown_lines)
 
@@ -194,12 +212,15 @@ def run_synthesis_llm(
         f"Decision problem:\n{decision_input.problem_description}\n\n"
         f"Options:\n{options_text}\n\n"
         f"Criteria and weights:\n{criteria_text}\n\n"
-        f"WSM numeric results (already computed):\n{breakdown_text}\n\n"
-        f"Winner: {wsm_result.winner}\n"
-        f"Loser (lowest score, if any): {wsm_result.loser or 'N/A'}\n\n"
+        "Fuzzy TOPSIS results (for each option):\n"
+        f"{breakdown_text}\n\n"
+        f"Winner: {topsis_result.winner}\n"
+        f"Loser (lowest score, if any): {topsis_result.loser or 'N/A'}\n\n"
         "Write a concise explanation in plain language focused on why the winner "
-        "won according to the scores and weights. Mention key criteria and how "
-        "they influenced the outcome."
+        "has the highest closeness coefficient. Mention key criteria where the winner "
+        "has strong fuzzy scores (high most-likely and upper values) relative to others, "
+        "and how the criterion weights influenced the outcome. Do not reference the "
+        "Fuzzy TOPSIS algorithm by name; just explain the reasoning."
     )
 
     try:

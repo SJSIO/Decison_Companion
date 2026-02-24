@@ -22,10 +22,44 @@ class OptionSchema(StrictBaseModel):
     description: Optional[str] = None
 
 
+class TriangularFuzzyNumber(StrictBaseModel):
+    """
+    Triangular fuzzy number representing a range of possible scores
+    on a 1–10 scale: (l, m, u) with 1.0 <= l <= m <= u <= 10.0.
+    """
+
+    l: float = Field(..., description="Lower (worst-case) bound of the score.")
+    m: float = Field(..., description="Most-likely score.")
+    u: float = Field(..., description="Upper (best-case) bound of the score.")
+
+    @validator("l", "m", "u")
+    def within_scale(cls, v: float) -> float:
+        if not (1.0 <= v <= 10.0):
+            raise ValueError("Fuzzy score components must be between 1.0 and 10.0.")
+        return v
+
+    @validator("m")
+    def m_not_less_than_l(cls, v: float, values) -> float:
+        l = values.get("l")
+        if l is not None and v < l:
+            raise ValueError("m must be greater than or equal to l.")
+        return v
+
+    @validator("u")
+    def u_not_less_than_m(cls, v: float, values) -> float:
+        m = values.get("m")
+        if m is not None and v < m:
+            raise ValueError("u must be greater than or equal to m.")
+        return v
+
+
 class OptionCriterionScore(StrictBaseModel):
     option_name: str
     criterion_name: str
-    score: PositiveInt = Field(..., ge=1, le=10, description="Score from 1 (worst) to 10 (best).")
+    score_tfn: TriangularFuzzyNumber = Field(
+        ...,
+        description="Triangular fuzzy score (l, m, u) on a 1–10 scale.",
+    )
     justification: str = Field(..., min_length=1)
 
     @validator("justification")
@@ -51,25 +85,19 @@ class AIResearchResultState(StrictBaseModel):
 class FinalScoresState(StrictBaseModel):
     scores: Dict[Tuple[str, str], OptionCriterionScore] = Field(
         default_factory=dict,
-        description="Final human-approved scores and justifications per (option, criterion).",
+        description="Final human-approved fuzzy scores and justifications per (option, criterion).",
     )
 
 
-class CriterionContribution(StrictBaseModel):
-    criterion_name: str
-    weight: int
-    score: int
-    contribution: int
-
-
-class OptionWSMResult(StrictBaseModel):
+class FuzzyOptionResult(StrictBaseModel):
     option_name: str
-    total_score: int
-    contributions: List[CriterionContribution]
+    closeness_coefficient: float
+    distance_to_fpis: float
+    distance_to_fnis: float
 
 
-class WSMResult(StrictBaseModel):
-    options: List[OptionWSMResult]
+class FuzzyTopsisResult(StrictBaseModel):
+    options: List[FuzzyOptionResult]
     winner: str
     loser: Optional[str] = None
 
@@ -87,6 +115,6 @@ class GraphState(StrictBaseModel):
     inputs: Optional[DecisionInputState] = None
     ai_scores: Optional[AIResearchResultState] = None
     final_scores: Optional[FinalScoresState] = None
-    wsm_result: Optional[WSMResult] = None
+    topsis_result: Optional[FuzzyTopsisResult] = None
     explanation: Optional[str] = None
 

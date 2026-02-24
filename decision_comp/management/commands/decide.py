@@ -11,6 +11,7 @@ from ...models import (
     OptionCriterionScore,
     OptionSchema,
     CriterionSchema,
+    TriangularFuzzyNumber,
 )
 
 
@@ -54,7 +55,7 @@ def _prompt_yes_no(prompt: str, default_yes: bool = True) -> bool:
 
 
 class Command(BaseCommand):
-    help = "Interactive Decision Companion CLI using a Weighted Sum Model and optional AI assistance."
+    help = "Interactive Decision Companion CLI using a Fuzzy TOPSIS engine and optional AI assistance."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -100,13 +101,13 @@ class Command(BaseCommand):
         final_scores = self._collect_final_scores(decision_input, ai_scores.scores if ai_scores else None)
 
         self.stdout.write("")
-        self.stdout.write(self.style.HTTP_INFO("Calculating Weighted Sum Model (WSM) results and explanation..."))
+        self.stdout.write(self.style.HTTP_INFO("Calculating Fuzzy TOPSIS results and explanation..."))
         try:
-            wsm_result, explanation = run_calculation_and_synthesis(decision_input, final_scores)
+            topsis_result, explanation = run_calculation_and_synthesis(decision_input, final_scores)
         except Exception as exc:
             raise CommandError(f"Calculation and synthesis failed: {exc}") from exc
 
-        self._display_wsm_results(wsm_result, explanation)
+        self._display_topsis_results(topsis_result, explanation)
 
     def _collect_decision_input(self) -> DecisionInputState:
         problem_description = _prompt_non_empty("Describe the decision problem:\n> ")
@@ -152,8 +153,10 @@ class Command(BaseCommand):
                 if not score_entry:
                     self.stdout.write(f"  [NO SCORE RETURNED] Criterion: {crit.name}")
                     continue
+                tfn = score_entry.score_tfn
                 self.stdout.write(
-                    f"  Criterion: {crit.name} | Score: {score_entry.score}/10 | "
+                    f"  Criterion: {crit.name} | "
+                    f"Fuzzy score: [{tfn.l:.2f}, {tfn.m:.2f}, {tfn.u:.2f}] / 10 | "
                     f"Reason: {score_entry.justification}"
                 )
 
@@ -175,7 +178,8 @@ class Command(BaseCommand):
                 if ai_entry:
                     self.stdout.write(
                         f"  Criterion: {crit.name}\n"
-                        f"    AI suggested score: {ai_entry.score}/10\n"
+                        f"    AI suggested fuzzy score: "
+                        f"[{ai_entry.score_tfn.l:.2f}, {ai_entry.score_tfn.m:.2f}, {ai_entry.score_tfn.u:.2f}] / 10\n"
                         f"    Justification: {ai_entry.justification}"
                     )
                     accept = _prompt_yes_no("    Accept this score?", default_yes=True)
@@ -187,36 +191,64 @@ class Command(BaseCommand):
                 else:
                     self.stdout.write(f"  Criterion: {crit.name} (no AI suggestion available)")
 
-                # Manual entry path.
-                score_value = _prompt_int("    Your score (1-10): ", min_value=1, max_value=10)
+                # Manual entry path for fuzzy score.
+                while True:
+                    raw = input(
+                        "    Enter fuzzy score as 'l m u' (floats in 1-10, "
+                        "with l <= m <= u), or a single integer 1-10 for a crisp score: "
+                    ).strip()
+                    parts = raw.split()
+                    try:
+                        if len(parts) == 1:
+                            # Treat as crisp score and expand to a narrow TFN.
+                            x = float(parts[0])
+                            if not (1.0 <= x <= 10.0):
+                                raise ValueError
+                            l_val = max(1.0, x - 0.5)
+                            u_val = min(10.0, x + 0.5)
+                            tfn = TriangularFuzzyNumber(l=l_val, m=x, u=u_val)
+                        elif len(parts) == 3:
+                            l_val, m_val, u_val = map(float, parts)
+                            tfn = TriangularFuzzyNumber(l=l_val, m=m_val, u=u_val)
+                        else:
+                            raise ValueError
+                    except Exception:
+                        self.stdout.write(
+                            self.style.WARNING(
+                                "    Invalid fuzzy score. Please enter either one integer 1-10 "
+                                "or three floats l m u with 1.0 <= l <= m <= u <= 10.0."
+                            )
+                        )
+                        continue
+
+                    break
+
                 justification = _prompt_non_empty("    Your one-sentence justification: ")
                 final_scores.scores[key] = OptionCriterionScore(
                     option_name=opt.name,
                     criterion_name=crit.name,
-                    score=score_value,
+                    score_tfn=tfn,
                     justification=justification,
                 )
 
         return final_scores
 
-    def _display_wsm_results(self, wsm_result, explanation: str) -> None:
+    def _display_topsis_results(self, topsis_result, explanation: str) -> None:
         self.stdout.write("")
-        self.stdout.write(self.style.MIGRATE_HEADING("Weighted Sum Model Results"))
+        self.stdout.write(self.style.MIGRATE_HEADING("Fuzzy TOPSIS Results"))
 
-        for opt in wsm_result.options:
+        for opt in topsis_result.options:
             self.stdout.write(f"\nOption: {opt.option_name}")
-            self.stdout.write(f"  Total score: {opt.total_score}")
-            for contrib in opt.contributions:
-                self.stdout.write(
-                    f"    - {contrib.criterion_name}: "
-                    f"weight={contrib.weight}, score={contrib.score}, "
-                    f"contribution={contrib.contribution}"
-                )
+            self.stdout.write(
+                f"  Distance to FPIS (D+): {opt.distance_to_fpis:.4f}\n"
+                f"  Distance to FNIS (D-): {opt.distance_to_fnis:.4f}\n"
+                f"  Closeness coefficient (CC): {opt.closeness_coefficient:.4f}"
+            )
 
         self.stdout.write("")
-        self.stdout.write(self.style.SUCCESS(f"Winner: {wsm_result.winner}"))
-        if wsm_result.loser:
-            self.stdout.write(self.style.WARNING(f"Lowest-scoring option: {wsm_result.loser}"))
+        self.stdout.write(self.style.SUCCESS(f"Winner: {topsis_result.winner}"))
+        if topsis_result.loser:
+            self.stdout.write(self.style.WARNING(f"Lowest-scoring option: {topsis_result.loser}"))
 
         self.stdout.write("")
         self.stdout.write(self.style.MIGRATE_HEADING("Explanation"))
