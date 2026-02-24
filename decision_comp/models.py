@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Literal
 
 from pydantic import BaseModel, Field, PositiveInt, validator
 
@@ -15,6 +15,10 @@ class CriterionSchema(StrictBaseModel):
     name: str = Field(..., min_length=1)
     weight: PositiveInt = Field(..., ge=1, le=10, description="Importance weight from 1 (lowest) to 10 (highest).")
     description: Optional[str] = None
+    kind: Literal["benefit", "cost"] = Field(
+        "benefit",
+        description="How this criterion behaves: 'benefit' (higher is better) or 'cost' (lower is better).",
+    )
 
 
 class OptionSchema(StrictBaseModel):

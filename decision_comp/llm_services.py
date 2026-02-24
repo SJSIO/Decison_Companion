@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import List
+from typing import List, Literal
 
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -44,6 +44,16 @@ class ResearchBatchOutput(StrictBaseModel):
 
 class SynthesisOutput(StrictBaseModel):
     explanation: str = Field(..., min_length=1)
+
+
+class CriterionNature(StrictBaseModel):
+    criterion_name: str
+    kind: Literal["benefit", "cost"]
+    rationale: str = Field(..., min_length=1)
+
+
+class CriterionNatureBatchOutput(StrictBaseModel):
+    items: List[CriterionNature]
 
 
 def get_llm(model_name: str = "llama-3.3-70b-versatile") -> ChatGroq:
@@ -161,6 +171,49 @@ def run_research_llm(decision_input: DecisionInputState) -> ResearchBatchOutput:
                 "AI returned duplicate scores for the same (option_index, criterion_index) pair."
             )
         seen_pairs.add(pair)
+
+    return result
+
+
+def classify_criteria_nature(decision_input: DecisionInputState) -> CriterionNatureBatchOutput:
+    """
+    Use the LLM to classify each criterion as 'benefit' (higher is better)
+    or 'cost' (lower is better), with a short rationale.
+    """
+    llm = get_llm()
+
+    system_prompt = (
+        "You classify decision criteria as either 'benefit' (higher values are better) "
+        "or 'cost' (lower values are better).\n"
+        "Examples:\n"
+        "- 'Battery life' -> benefit\n"
+        "- 'Price', 'Latency', 'Response time', 'CO2 emissions' -> cost\n"
+        "Base your decision only on the criterion names and descriptions provided."
+    )
+
+    criteria_block = "\n".join(
+        f"- {idx}: {c.name} — {c.description or 'No additional description.'}"
+        for idx, c in enumerate(decision_input.criteria)
+    )
+
+    user_prompt = (
+        "Classify each of the following criteria:\n"
+        f"{criteria_block}\n\n"
+        "For each criterion, output:\n"
+        "- criterion_name: exactly as given\n"
+        "- kind: 'benefit' or 'cost'\n"
+        "- rationale: ONE sentence justifying your choice"
+    )
+
+    try:
+        structured_llm = llm.with_structured_output(CriterionNatureBatchOutput)
+        result: CriterionNatureBatchOutput = structured_llm.invoke(
+            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        )
+    except ValidationError as ve:
+        raise RuntimeError(f"Failed to validate criterion nature output: {ve}") from ve
+    except Exception as exc:
+        raise RuntimeError(f"Error while classifying criteria nature: {exc}") from exc
 
     return result
 

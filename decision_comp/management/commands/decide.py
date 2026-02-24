@@ -5,6 +5,7 @@ from typing import Dict, Tuple
 from django.core.management.base import BaseCommand, CommandError
 
 from ...graph import run_ai_research, run_calculation_and_synthesis
+from ...llm_services import classify_criteria_nature
 from ...models import (
     DecisionInputState,
     FinalScoresState,
@@ -127,8 +128,50 @@ class Command(BaseCommand):
             name = _prompt_non_empty("  Name: ")
             description = input("  Description (optional): ").strip() or None
             weight = _prompt_int("  Weight (1-10, higher means more important): ", min_value=1, max_value=10)
+            # Temporarily set kind to default; we'll refine via AI + human-in-the-loop.
             criteria.append(CriterionSchema(name=name, weight=weight, description=description))
 
+        # Build preliminary decision input for AI-based criterion classification.
+        try:
+            decision_input = DecisionInputState(
+                problem_description=problem_description,
+                options=options,
+                criteria=criteria,
+            )
+        except Exception as exc:
+            raise CommandError(f"Invalid decision input: {exc}") from exc
+
+        # Let the AI suggest benefit/cost nature for each criterion, then confirm with the user.
+        self.stdout.write("")
+        self.stdout.write(self.style.HTTP_INFO("Classifying criteria as benefit or cost..."))
+        nature_by_name: Dict[str, str] = {}
+        try:
+            nature_batch = classify_criteria_nature(decision_input)
+            for item in nature_batch.items:
+                nature_by_name[item.criterion_name] = item.kind
+        except Exception as exc:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"AI criterion classification failed: {exc}. Defaulting all criteria to 'benefit'."
+                )
+            )
+
+        for crit in criteria:
+            suggested_kind = nature_by_name.get(crit.name, "benefit")
+            self.stdout.write(f"\nCriterion: {crit.name}")
+            self.stdout.write(f"  AI suggests type: {suggested_kind}")
+            accept_kind = _prompt_yes_no("  Accept this type?", default_yes=True)
+            if accept_kind:
+                crit.kind = suggested_kind
+            else:
+                while True:
+                    manual = input("  Enter criterion type ('benefit' or 'cost'): ").strip().lower()
+                    if manual in ("benefit", "cost"):
+                        crit.kind = manual
+                        break
+                    self.stdout.write("  Please enter 'benefit' or 'cost'.")
+
+        # Rebuild the decision input with confirmed kinds.
         try:
             return DecisionInputState(
                 problem_description=problem_description,
@@ -136,7 +179,7 @@ class Command(BaseCommand):
                 criteria=criteria,
             )
         except Exception as exc:
-            raise CommandError(f"Invalid decision input: {exc}") from exc
+            raise CommandError(f"Invalid decision input after criterion classification: {exc}") from exc
 
     def _display_ai_scores(
         self,

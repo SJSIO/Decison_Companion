@@ -63,27 +63,46 @@ def _normalize_fuzzy_matrix(
     normalized: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber] = {}
 
     for crit in inputs.criteria:
-        # Find max upper bound for this criterion across all options.
-        max_u = 0.0
+        # Collect TFNs for this criterion across all options.
+        tfn_by_option: Dict[str, TriangularFuzzyNumber] = {}
         for opt in inputs.options:
             key = (opt.name, crit.name)
             if key not in final_scores.scores:
                 raise ValueError(f"Missing score for option '{opt.name}' and criterion '{crit.name}'.")
-            tfn = final_scores.scores[key].score_tfn
-            max_u = max(max_u, tfn.u)
+            tfn_by_option[opt.name] = final_scores.scores[key].score_tfn
 
-        if max_u <= 0.0:
-            raise ValueError(f"Maximum upper bound for criterion '{crit.name}' must be positive.")
+        if crit.kind == "benefit":
+            # Benefit criterion: divide by max upper bound.
+            max_u = max(t.u for t in tfn_by_option.values())
+            if max_u <= 0.0:
+                raise ValueError(f"Maximum upper bound for criterion '{crit.name}' must be positive.")
 
-        # Normalize all TFNs for this criterion.
-        for opt in inputs.options:
-            key = (opt.name, crit.name)
-            tfn = final_scores.scores[key].score_tfn
-            normalized[key] = NormalizedTriangularFuzzyNumber(
-                l=tfn.l / max_u,
-                m=tfn.m / max_u,
-                u=tfn.u / max_u,
-            )
+            for opt in inputs.options:
+                tfn = tfn_by_option[opt.name]
+                normalized[(opt.name, crit.name)] = NormalizedTriangularFuzzyNumber(
+                    l=tfn.l / max_u,
+                    m=tfn.m / max_u,
+                    u=tfn.u / max_u,
+                )
+        else:
+            # Cost criterion: flip the scale using the minimum lower bound.
+            min_l = min(t.l for t in tfn_by_option.values())
+            if min_l <= 0.0:
+                raise ValueError(f"Minimum lower bound for cost criterion '{crit.name}' must be positive.")
+
+            for opt in inputs.options:
+                tfn = tfn_by_option[opt.name]
+                # Guard against division by zero; if any component is non-positive, raise.
+                if tfn.l <= 0.0 or tfn.m <= 0.0 or tfn.u <= 0.0:
+                    raise ValueError(
+                        f"Cost criterion '{crit.name}' has non-positive TFN components "
+                        f"for option '{opt.name}', cannot normalize."
+                    )
+                normalized[(opt.name, crit.name)] = NormalizedTriangularFuzzyNumber(
+                    l=min_l / tfn.u,
+                    m=min_l / tfn.m,
+                    u=min_l / tfn.l,
+                )
 
     return normalized
 
