@@ -53,6 +53,38 @@ class TriangularFuzzyNumber(StrictBaseModel):
         return v
 
 
+class NormalizedTriangularFuzzyNumber(StrictBaseModel):
+    """
+    Triangular fuzzy number used internally for normalized scores in [0, 1].
+    This is separate from TriangularFuzzyNumber, which represents user-facing
+    scores on the original 1–10 scale.
+    """
+
+    l: float = Field(..., description="Lower bound of the normalized score (0.0–1.0).")
+    m: float = Field(..., description="Most-likely normalized score (0.0–1.0).")
+    u: float = Field(..., description="Upper bound of the normalized score (0.0–1.0).")
+
+    @validator("l", "m", "u")
+    def within_normalized_scale(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("Normalized fuzzy score components must be between 0.0 and 1.0.")
+        return v
+
+    @validator("m")
+    def m_not_less_than_l(cls, v: float, values) -> float:
+        l = values.get("l")
+        if l is not None and v < l:
+            raise ValueError("For normalized TFNs, m must be greater than or equal to l.")
+        return v
+
+    @validator("u")
+    def u_not_less_than_m(cls, v: float, values) -> float:
+        m = values.get("m")
+        if m is not None and v < m:
+            raise ValueError("For normalized TFNs, u must be greater than or equal to m.")
+        return v
+
+
 class OptionCriterionScore(StrictBaseModel):
     option_name: str
     criterion_name: str

@@ -12,6 +12,7 @@ from .models import (
     FuzzyOptionResult,
     FuzzyTopsisResult,
     GraphState,
+    NormalizedTriangularFuzzyNumber,
     OptionCriterionScore,
     TriangularFuzzyNumber,
 )
@@ -53,13 +54,13 @@ def ai_research_node(state: GraphState) -> GraphState:
 def _normalize_fuzzy_matrix(
     inputs: DecisionInputState,
     final_scores: FinalScoresState,
-) -> Dict[Tuple[str, str], TriangularFuzzyNumber]:
+) -> Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber]:
     """
     Normalize the fuzzy decision matrix for benefit criteria.
     For each criterion, divide each TFN (l, m, u) by the maximum upper bound u
-    across all options for that criterion.
+    across all options for that criterion, producing normalized TFNs in [0, 1].
     """
-    normalized: Dict[Tuple[str, str], TriangularFuzzyNumber] = {}
+    normalized: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber] = {}
 
     for crit in inputs.criteria:
         # Find max upper bound for this criterion across all options.
@@ -78,7 +79,7 @@ def _normalize_fuzzy_matrix(
         for opt in inputs.options:
             key = (opt.name, crit.name)
             tfn = final_scores.scores[key].score_tfn
-            normalized[key] = TriangularFuzzyNumber(
+            normalized[key] = NormalizedTriangularFuzzyNumber(
                 l=tfn.l / max_u,
                 m=tfn.m / max_u,
                 u=tfn.u / max_u,
@@ -88,13 +89,13 @@ def _normalize_fuzzy_matrix(
 
 
 def _apply_weights(
-    normalized: Dict[Tuple[str, str], TriangularFuzzyNumber],
+    normalized: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber],
     inputs: DecisionInputState,
-) -> Dict[Tuple[str, str], TriangularFuzzyNumber]:
+) -> Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber]:
     """
     Multiply each normalized TFN by the corresponding criterion's crisp weight.
     """
-    weighted: Dict[Tuple[str, str], TriangularFuzzyNumber] = {}
+    weighted: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber] = {}
 
     weight_by_criterion: Dict[str, int] = {c.name: c.weight for c in inputs.criteria}
 
@@ -103,7 +104,7 @@ def _apply_weights(
             key = (opt.name, crit.name)
             tfn = normalized[key]
             w = float(weight_by_criterion[crit.name])
-            weighted[key] = TriangularFuzzyNumber(
+            weighted[key] = NormalizedTriangularFuzzyNumber(
                 l=tfn.l * w,
                 m=tfn.m * w,
                 u=tfn.u * w,
@@ -113,15 +114,16 @@ def _apply_weights(
 
 
 def _compute_fpis_fnis(
-    weighted: Dict[Tuple[str, str], TriangularFuzzyNumber],
+    weighted: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber],
     inputs: DecisionInputState,
-) -> Tuple[Dict[str, TriangularFuzzyNumber], Dict[str, TriangularFuzzyNumber]]:
+) -> Tuple[Dict[str, NormalizedTriangularFuzzyNumber], Dict[str, NormalizedTriangularFuzzyNumber]]:
     """
     Compute the Fuzzy Positive Ideal Solution (FPIS) and
-    Fuzzy Negative Ideal Solution (FNIS) per criterion.
+    Fuzzy Negative Ideal Solution (FNIS) per criterion in the
+    normalized fuzzy space.
     """
-    fpis: Dict[str, TriangularFuzzyNumber] = {}
-    fnis: Dict[str, TriangularFuzzyNumber] = {}
+    fpis: Dict[str, NormalizedTriangularFuzzyNumber] = {}
+    fnis: Dict[str, NormalizedTriangularFuzzyNumber] = {}
 
     for crit in inputs.criteria:
         l_vals = []
@@ -134,12 +136,12 @@ def _compute_fpis_fnis(
             m_vals.append(tfn.m)
             u_vals.append(tfn.u)
 
-        fpis[crit.name] = TriangularFuzzyNumber(
+        fpis[crit.name] = NormalizedTriangularFuzzyNumber(
             l=max(l_vals),
             m=max(m_vals),
             u=max(u_vals),
         )
-        fnis[crit.name] = TriangularFuzzyNumber(
+        fnis[crit.name] = NormalizedTriangularFuzzyNumber(
             l=min(l_vals),
             m=min(m_vals),
             u=min(u_vals),
@@ -148,7 +150,10 @@ def _compute_fpis_fnis(
     return fpis, fnis
 
 
-def _distance_between_tfn(a: TriangularFuzzyNumber, b: TriangularFuzzyNumber) -> float:
+def _distance_between_tfn(
+    a: NormalizedTriangularFuzzyNumber,
+    b: NormalizedTriangularFuzzyNumber,
+) -> float:
     """
     Euclidean distance between two TFNs using the vertex method.
     d(a,b) = sqrt( ( (al-bl)^2 + (am-bm)^2 + (au-bu)^2 ) / 3 ).
