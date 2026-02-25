@@ -76,7 +76,7 @@ def _normalize_fuzzy_matrix(
             tfn_by_option[opt.name] = final_scores.scores[key].score_tfn
 
         if crit.kind == "benefit":
-            # Benefit criterion: divide by max upper bound.
+            # Benefit criterion: divide each TFN by the maximum upper bound u across all options.
             max_u = max(t.u for t in tfn_by_option.values())
             if max_u <= 0.0:
                 raise ValueError(f"Maximum upper bound for criterion '{crit.name}' must be positive.")
@@ -89,12 +89,11 @@ def _normalize_fuzzy_matrix(
                     u=tfn.u / max_u,
                 )
         else:
-            # Cost criterion: flip with min_l / TFN, then scale to [0, 1].
+            # Cost criterion: use the requested formula (l_min/u, l_min/m, l_min/l).
             min_l = min(t.l for t in tfn_by_option.values())
             if min_l <= 0.0:
                 raise ValueError(f"Minimum lower bound for cost criterion '{crit.name}' must be positive.")
 
-            flipped: Dict[str, Tuple[float, float, float]] = {}
             for opt in inputs.options:
                 tfn = tfn_by_option[opt.name]
                 if tfn.l <= 0.0 or tfn.m <= 0.0 or tfn.u <= 0.0:
@@ -102,24 +101,10 @@ def _normalize_fuzzy_matrix(
                         f"Cost criterion '{crit.name}' has non-positive TFN components "
                         f"for option '{opt.name}', cannot flip."
                     )
-                flipped[opt.name] = (
-                    min_l / tfn.u,
-                    min_l / tfn.m,
-                    min_l / tfn.l,
-                )
-
-            max_u_flipped = max(triple[2] for triple in flipped.values())
-            if max_u_flipped <= 0.0:
-                raise ValueError(
-                    f"Maximum flipped upper bound for cost criterion '{crit.name}' must be positive."
-                )
-
-            for opt in inputs.options:
-                fl, fm, fu = flipped[opt.name]
                 normalized[(opt.name, crit.name)] = NormalizedTriangularFuzzyNumber(
-                    l=fl / max_u_flipped,
-                    m=fm / max_u_flipped,
-                    u=fu / max_u_flipped,
+                    l=min_l / tfn.u,
+                    m=min_l / tfn.m,
+                    u=min_l / tfn.l,
                 )
 
     return normalized

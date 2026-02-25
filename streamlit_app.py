@@ -13,16 +13,32 @@ API_BASE_URL = "http://localhost:8000"
 
 
 def _ensure_session_state():
+    # Core decision definition
+    if "num_options" not in st.session_state:
+        st.session_state.num_options = 2
+    if "num_criteria" not in st.session_state:
+        st.session_state.num_criteria = 1
     if "options" not in st.session_state:
         st.session_state.options = []
     if "criteria" not in st.session_state:
         st.session_state.criteria = []
     if "problem_description" not in st.session_state:
         st.session_state.problem_description = ""
+
+    # Research + human-in-the-loop state
     if "research_scores" not in st.session_state:
-        st.session_state.research_scores = None
-    if "edited_df" not in st.session_state:
-        st.session_state.edited_df = None
+        st.session_state.research_scores = []
+    if "criterion_meta" not in st.session_state:
+        # List of dicts: {name, weight, description, kind, rationale}
+        st.session_state.criterion_meta = []
+    if "criterion_kinds" not in st.session_state:
+        # Mapping criterion_name -> "benefit" / "cost" (user-overridable)
+        st.session_state.criterion_kinds = {}
+    if "edited_scores" not in st.session_state:
+        # Mapping criterion_name -> DataFrame of rows for that criterion
+        st.session_state.edited_scores = {}
+
+    # Final result
     if "calculate_result" not in st.session_state:
         st.session_state.calculate_result = None
 
@@ -63,51 +79,126 @@ def main():
     st.title("Decision Companion")
     st.caption("Define options and criteria, run AI research, edit fuzzy scores, then run the final decision.")
 
-    # ----- Phase 1: Inputs -----
-    st.header("Phase 1: Options and criteria")
+    # ----- Phase 1: Dynamic decision inputs -----
+    st.header("Phase 1: Overall goal, options, and criteria")
 
+    # Overall goal / context (required, feeds directly into problem_description)
     problem = st.text_area(
-        "Problem description (optional)",
+        "Overall Goal / Context",
         value=st.session_state.problem_description,
-        key="problem_input",
+        key="overall_goal",
         height=80,
+        help="Describe what you are trying to decide. This is passed to the AI for research and final explanation.",
     )
     st.session_state.problem_description = problem
 
-    col_crit, col_opt = st.columns(2)
+    col_counts = st.columns(2)
+    with col_counts[0]:
+        st.number_input(
+            "Number of Options",
+            min_value=2,
+            step=1,
+            key="num_options",
+            help="How many options do you want to compare?",
+        )
+    with col_counts[1]:
+        st.number_input(
+            "Number of Criteria",
+            min_value=1,
+            step=1,
+            key="num_criteria",
+            help="How many criteria will you use to evaluate the options?",
+        )
 
-    with col_crit:
-        st.subheader("Criteria")
-        new_crit_name = st.text_input("Criterion name", key="new_criterion_name")
-        new_crit_weight = st.slider("Weight (1–10)", 1, 10, 5, key="new_criterion_weight")
-        if st.button("Add criterion") and new_crit_name.strip():
-            st.session_state.criteria.append({"name": new_crit_name.strip(), "weight": new_crit_weight})
-            st.rerun()
-        for i, c in enumerate(st.session_state.criteria):
-            st.text(f"• {c['name']} (weight {c['weight']})")
-            if st.button("Remove", key=f"rem_crit_{i}"):
-                st.session_state.criteria.pop(i)
-                st.rerun()
+    num_options = int(st.session_state.num_options)
+    num_criteria = int(st.session_state.num_criteria)
 
-    with col_opt:
+    # Ensure options/criteria lists match the selected counts
+    if len(st.session_state.options) < num_options:
+        for _ in range(num_options - len(st.session_state.options)):
+            st.session_state.options.append({"name": "", "description": ""})
+    elif len(st.session_state.options) > num_options:
+        st.session_state.options = st.session_state.options[:num_options]
+
+    if len(st.session_state.criteria) < num_criteria:
+        for _ in range(num_criteria - len(st.session_state.criteria)):
+            st.session_state.criteria.append(
+                {"name": "", "weight": 5, "description": "", "kind": "benefit"}
+            )
+    elif len(st.session_state.criteria) > num_criteria:
+        st.session_state.criteria = st.session_state.criteria[:num_criteria]
+
+    col_opts, col_crits = st.columns(2)
+
+    # Dynamic option inputs
+    with col_opts:
         st.subheader("Options")
-        new_opt_name = st.text_input("Option name", key="new_option_name")
-        if st.button("Add option") and new_opt_name.strip():
-            st.session_state.options.append({"name": new_opt_name.strip()})
-            st.rerun()
-        for i, o in enumerate(st.session_state.options):
-            st.text(f"• {o['name']}")
-            if st.button("Remove", key=f"rem_opt_{i}"):
-                st.session_state.options.pop(i)
-                st.rerun()
+        for i in range(num_options):
+            opt = st.session_state.options[i]
+            name_key = f"option_name_{i}"
+            name_val = st.text_input(
+                f"Option {i + 1} name",
+                value=opt.get("name", ""),
+                key=name_key,
+            )
+            opt["name"] = name_val.strip()
+            # Basic UI per requirement: only names for options for now.
 
-    if len(st.session_state.options) < 2 or len(st.session_state.criteria) < 1:
-        st.info("Add at least 2 options and 1 criterion to continue.")
-        return
+    # Dynamic criterion inputs
+    with col_crits:
+        st.subheader("Criteria")
+        for i in range(num_criteria):
+            crit = st.session_state.criteria[i]
+            if "name" not in crit:
+                crit["name"] = ""
+            if "weight" not in crit:
+                crit["weight"] = 5
+            if "description" not in crit:
+                crit["description"] = ""
+            if "kind" not in crit:
+                crit["kind"] = "benefit"
+
+            st.markdown(f"**Criterion {i + 1}**")
+            crit_name = st.text_input(
+                "Name",
+                value=crit["name"],
+                key=f"criterion_name_{i}",
+            )
+            crit_weight = st.number_input(
+                "Weight (1–10)",
+                min_value=1,
+                max_value=10,
+                step=1,
+                value=int(crit["weight"]),
+                key=f"criterion_weight_{i}",
+            )
+            crit_description = st.text_area(
+                "Description (optional)",
+                value=crit.get("description") or "",
+                key=f"criterion_desc_{i}",
+                height=60,
+            )
+
+            crit["name"] = crit_name.strip()
+            crit["weight"] = int(crit_weight)
+            crit["description"] = crit_description.strip()
+
+    # Validation for proceeding
+    options_valid = num_options >= 2 and all(o["name"] for o in st.session_state.options)
+    criteria_valid = num_criteria >= 1 and all(
+        c["name"] and 1 <= int(c["weight"]) <= 10 for c in st.session_state.criteria
+    )
+    goal_valid = bool(st.session_state.problem_description.strip())
+
+    if not goal_valid:
+        st.info("Please describe your overall goal/context before running AI research.")
+    if not options_valid or not criteria_valid:
+        st.info("You need at least 2 named options and 1 named criterion (with weights 1–10).")
 
     # ----- Phase 2: Research -----
     st.header("Phase 2: AI research")
-    if st.button("Run AI research"):
+    research_disabled = not (goal_valid and options_valid and criteria_valid)
+    if st.button("Run AI research", disabled=research_disabled):
         with st.spinner("AI agents researching and validating data..."):
             try:
                 result = _api_research(
@@ -116,7 +207,16 @@ def main():
                     st.session_state.criteria,
                 )
                 st.session_state.research_scores = result.get("scores") or []
-                st.session_state.edited_df = None
+                st.session_state.criterion_meta = result.get("criteria") or []
+                # Initialize kinds from LLM guesses (or default to benefit)
+                kinds = {}
+                for crit in st.session_state.criterion_meta:
+                    name = crit.get("name")
+                    if not name:
+                        continue
+                    kinds[name] = (crit.get("kind") or "benefit").lower()
+                st.session_state.criterion_kinds = kinds
+                st.session_state.edited_scores = {}
                 st.success("Research complete. Review and edit scores below.")
             except requests.RequestException as e:
                 st.error(f"Research request failed: {e}")
@@ -125,38 +225,132 @@ def main():
         st.rerun()
 
     # ----- Phase 3: Human-in-the-loop -----
-    st.header("Phase 3: Review and edit scores")
+    st.header("Phase 3: Review and edit scores (per criterion)")
     scores = st.session_state.research_scores
-    if scores:
-        df = pd.DataFrame(scores)
-        if st.session_state.edited_df is not None:
-            df = st.session_state.edited_df
-        edited = st.data_editor(
-            df,
-            use_container_width=True,
-            key="scores_editor",
-            column_config={
-                "option_name": st.column_config.TextColumn("Option", disabled=True),
-                "criterion_name": st.column_config.TextColumn("Criterion", disabled=True),
-                "l": st.column_config.NumberColumn("l", min_value=1.0, max_value=10.0, format="%.2f"),
-                "m": st.column_config.NumberColumn("m", min_value=1.0, max_value=10.0, format="%.2f"),
-                "u": st.column_config.NumberColumn("u", min_value=1.0, max_value=10.0, format="%.2f"),
-                "justification": st.column_config.TextColumn("Justification"),
-            },
-        )
-        st.session_state.edited_df = edited
+    criterion_meta = st.session_state.criterion_meta
 
-        # ----- Phase 4: Calculation -----
-        st.header("Phase 4: Final decision")
+    if scores and criterion_meta:
+        # Render one editor per criterion
+        for crit in criterion_meta:
+            crit_name = crit.get("name")
+            if not crit_name:
+                continue
+
+            crit_desc = crit.get("description") or ""
+            crit_kind_llm = (crit.get("kind") or "benefit").lower()
+            crit_rationale = crit.get("rationale") or ""
+
+            st.subheader(f"Criterion: {crit_name}")
+            if crit_desc:
+                st.caption(crit_desc)
+
+            # Benefit/cost selectbox with AI guess as default
+            current_kind = st.session_state.criterion_kinds.get(crit_name, crit_kind_llm)
+            kind_index = 0 if current_kind == "benefit" else 1
+            selected_kind = st.selectbox(
+                "Criterion type (benefit/cost)",
+                options=["benefit", "cost"],
+                index=kind_index,
+                key=f"criterion_kind_{crit_name}",
+            )
+            st.session_state.criterion_kinds[crit_name] = selected_kind
+
+            if crit_rationale:
+                st.caption(f"LLM rationale: {crit_rationale}")
+
+            # Build or reuse the DataFrame for this criterion
+            if crit_name in st.session_state.edited_scores:
+                df = st.session_state.edited_scores[crit_name]
+            else:
+                rows = [row for row in scores if row.get("criterion_name") == crit_name]
+                if not rows:
+                    st.warning("No scores found for this criterion.")
+                    continue
+                df = pd.DataFrame(rows)
+                # Only keep the relevant columns for editing
+                expected_cols = ["option_name", "l", "m", "u", "justification"]
+                existing_cols = [c for c in expected_cols if c in df.columns]
+                df = df[existing_cols]
+
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                key=f"scores_editor_{crit_name}",
+                column_config={
+                    "option_name": st.column_config.TextColumn("Option", disabled=True),
+                    "l": st.column_config.NumberColumn("l", min_value=1.0, max_value=10.0, format="%.2f"),
+                    "m": st.column_config.NumberColumn("m", min_value=1.0, max_value=10.0, format="%.2f"),
+                    "u": st.column_config.NumberColumn("u", min_value=1.0, max_value=10.0, format="%.2f"),
+                    "justification": st.column_config.TextColumn("Justification"),
+                },
+            )
+            st.session_state.edited_scores[crit_name] = edited_df
+    else:
+        st.info("Run AI research first to see per-criterion score tables.")
+
+    # ----- Phase 4: Calculation -----
+    st.header("Phase 4: Final decision")
+    can_calculate = bool(scores and criterion_meta)
+    if not can_calculate:
+        st.info("You must run AI research and review scores before running the final decision.")
+    else:
         if st.button("Run final decision"):
-            # Use edited dataframe as scores list.
-            scores_payload = edited.to_dict(orient="records")
+            # Flatten per-criterion edited tables into a single scores list.
+            scores_payload = []
+            for crit in criterion_meta:
+                crit_name = crit.get("name")
+                if not crit_name:
+                    continue
+
+                df = st.session_state.edited_scores.get(crit_name)
+                if df is None:
+                    # Fallback: build from original scores for this criterion.
+                    rows = [row for row in scores if row.get("criterion_name") == crit_name]
+                    if not rows:
+                        continue
+                    df = pd.DataFrame(rows)
+                    expected_cols = ["option_name", "l", "m", "u", "justification"]
+                    existing_cols = [c for c in expected_cols if c in df.columns]
+                    df = df[existing_cols]
+
+                for row in df.to_dict(orient="records"):
+                    scores_payload.append(
+                        {
+                            "option_name": row["option_name"],
+                            "criterion_name": crit_name,
+                            "l": row["l"],
+                            "m": row["m"],
+                            "u": row["u"],
+                            "justification": row.get("justification", "") or "",
+                        }
+                    )
+
+            # Build criteria payload including user-overridden kinds.
+            criteria_payload = []
+            for crit in st.session_state.criteria:
+                name = crit["name"]
+                kind_override = st.session_state.criterion_kinds.get(name, crit.get("kind") or "benefit")
+                criteria_payload.append(
+                    {
+                        "name": name,
+                        "weight": crit["weight"],
+                        "description": crit.get("description") or "",
+                        "kind": kind_override,
+                    }
+                )
+
+            # Options payload (names only for now).
+            options_payload = [
+                {"name": o["name"], "description": o.get("description") or ""}
+                for o in st.session_state.options
+            ]
+
             with st.spinner("Computing Fuzzy TOPSIS and synthesis..."):
                 try:
                     calc = _api_calculate(
                         st.session_state.problem_description,
-                        st.session_state.options,
-                        st.session_state.criteria,
+                        options_payload,
+                        criteria_payload,
                         scores_payload,
                     )
                     st.session_state.calculate_result = calc
@@ -166,8 +360,6 @@ def main():
                 except Exception as e:
                     st.error(str(e))
             st.rerun()
-    else:
-        st.info("Run AI research first to see the scores grid.")
 
     # ----- Phase 5: Results -----
     result = st.session_state.calculate_result
@@ -183,7 +375,8 @@ def main():
 
         if explanation:
             st.subheader("Explanation")
-            st.write(explanation)
+            # Explanation is markdown with two sections: Algorithmic Breakdown & Contextual Fit.
+            st.markdown(explanation)
 
         if options_cc:
             st.subheader("Closeness coefficients")

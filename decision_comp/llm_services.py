@@ -223,21 +223,31 @@ def run_synthesis_llm(
     topsis_result: FuzzyTopsisResult,
 ) -> SynthesisOutput:
     """
-    Call the Groq Llama model to synthesize a short explanation of
-    why the winning option achieved the highest Fuzzy TOPSIS closeness
-    coefficient, based on fuzzy scores and weights.
+    Call the Groq Llama model to synthesize a two-part markdown explanation:
+    1) Algorithmic Breakdown of why the winner achieved the highest closeness
+       coefficient based on fuzzy scores, weights, and distances.
+    2) Contextual Fit explaining how the winner aligns with the user's overall
+       goal and the criterion descriptions.
     """
     llm = get_llm()
 
     system_prompt = (
         "You are an explanation engine. You are given a decision problem, "
         "options, criteria with weights, fuzzy scores (as triangular fuzzy numbers), "
-        "and the results of a Fuzzy TOPSIS calculation. Your job is to write a short, "
-        "human-readable explanation (3-6 sentences) of exactly WHY the winner "
-        "won, grounded solely in the provided fuzzy scores, weights, and Fuzzy TOPSIS "
-        "closeness coefficients.\n"
-        "Do NOT introduce new facts or speculation. Only refer to the math, "
-        "weights, fuzzy ranges, and observed strengths/weaknesses implied by the numbers."
+        "and the results of a Fuzzy TOPSIS calculation.\n\n"
+        "You MUST produce a markdown explanation with TWO sections, in this order:\n"
+        "## Algorithmic Breakdown\n"
+        "- Explain exactly why the winner has the highest closeness coefficient.\n"
+        "- Refer to distances to the positive/negative ideal solutions and the "
+        "criterion weights.\n"
+        "- Stay strictly grounded in the math: fuzzy scores, weights, distances, "
+        "and closeness coefficients.\n\n"
+        "## Contextual Fit\n"
+        "- Explain how this mathematically winning option fits the user's overall "
+        "goal and the criterion descriptions.\n"
+        "- Use only the provided goal/context and criterion descriptions; do NOT "
+        "introduce new facts or speculative scenarios.\n"
+        "Do NOT reference Fuzzy TOPSIS by name; just explain the reasoning."
     )
 
     options_text = "\n".join(
@@ -262,18 +272,22 @@ def run_synthesis_llm(
     breakdown_text = "\n".join(breakdown_lines)
 
     user_prompt = (
-        f"Decision problem:\n{decision_input.problem_description}\n\n"
+        f"Decision problem (overall goal/context):\n{decision_input.problem_description}\n\n"
         f"Options:\n{options_text}\n\n"
         f"Criteria and weights:\n{criteria_text}\n\n"
         "Fuzzy TOPSIS results (for each option):\n"
         f"{breakdown_text}\n\n"
         f"Winner: {topsis_result.winner}\n"
         f"Loser (lowest score, if any): {topsis_result.loser or 'N/A'}\n\n"
-        "Write a concise explanation in plain language focused on why the winner "
-        "has the highest closeness coefficient. Mention key criteria where the winner "
-        "has strong fuzzy scores (high most-likely and upper values) relative to others, "
-        "and how the criterion weights influenced the outcome. Do not reference the "
-        "Fuzzy TOPSIS algorithm by name; just explain the reasoning."
+        "Write your answer in exactly TWO markdown sections with these headings:\n"
+        "## Algorithmic Breakdown\n"
+        "- Focus on distances to the ideal solutions, closeness coefficients, and "
+        "how the weights interact with the fuzzy scores.\n\n"
+        "## Contextual Fit\n"
+        "- Explain why this mathematically winning option fits the user's stated "
+        "overall goal and the criterion descriptions.\n"
+        "Do not add new information beyond what is implied by the numbers, goal, "
+        "and descriptions."
     )
 
     try:

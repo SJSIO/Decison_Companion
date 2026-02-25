@@ -12,6 +12,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from .graph import run_ai_research, run_calculation_and_synthesis
+from .llm_services import classify_criteria_nature
 from .models import (
     CriterionSchema,
     DecisionInputState,
@@ -100,7 +101,11 @@ def api_research(request):
     """
     POST /api/research/
     Body: { problem_description, options: [{name, description?}], criteria: [{name, weight, description?, kind?}] }
-    Returns: { scores: [{ option_name, criterion_name, l, m, u, justification }] }
+    Returns:
+      {
+        "scores": [{ option_name, criterion_name, l, m, u, justification }],
+        "criteria": [{ name, weight, description, kind, rationale }]
+      }
     """
     data = _parse_json_body(request)
     if data is None:
@@ -111,6 +116,18 @@ def api_research(request):
     except (KeyError, ValueError, TypeError) as e:
         return JsonResponse({"error": str(e)}, status=400)
 
+    try:
+        # First, classify criteria as benefit/cost using the LLM.
+        nature_batch = classify_criteria_nature(inputs)
+    except Exception as e:
+        return JsonResponse({"error": f"Criterion classification failed: {e}"}, status=500)
+
+    # Map classification results by criterion name.
+    nature_by_name: Dict[str, Any] = {}
+    for item in nature_batch.items:
+        nature_by_name[item.criterion_name] = item
+
+    # Run AI research to get fuzzy scores.
     try:
         ai_result = run_ai_research(inputs)
     except Exception as e:
@@ -128,7 +145,26 @@ def api_research(request):
             "justification": score_obj.justification,
         })
 
-    return JsonResponse({"scores": scores_list})
+    # Serialize criteria with LLM-derived kinds and rationales.
+    criteria_list = []
+    for crit in inputs.criteria:
+        nature = nature_by_name.get(crit.name)
+        kind = crit.kind
+        rationale = ""
+        if nature is not None:
+            kind = nature.kind
+            rationale = nature.rationale
+        criteria_list.append(
+            {
+                "name": crit.name,
+                "weight": crit.weight,
+                "description": crit.description,
+                "kind": kind,
+                "rationale": rationale,
+            }
+        )
+
+    return JsonResponse({"scores": scores_list, "criteria": criteria_list})
 
 
 @csrf_exempt
