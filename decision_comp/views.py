@@ -109,93 +109,106 @@ def api_research(request):
         "criteria": [{ name, weight, description, kind, rationale }]
       }
     """
-    data = _parse_json_body(request)
-    if data is None:
-        return JsonResponse({"error": "Invalid JSON body."}, status=400)
-
     try:
-        inputs = _research_payload_to_inputs(data)
-    except (KeyError, ValueError, TypeError) as e:
-        return JsonResponse({"error": str(e)}, status=400)
+        data = _parse_json_body(request)
+        if data is None:
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
 
-    try:
-        # First, classify criteria as benefit/cost using the LLM.
-        nature_batch = classify_criteria_nature(inputs)
+        try:
+            inputs = _research_payload_to_inputs(data)
+        except (KeyError, ValueError, TypeError) as e:
+            return JsonResponse({"error": str(e)}, status=400)
+
+        try:
+            # First, classify criteria as benefit/cost using the LLM.
+            nature_batch = classify_criteria_nature(inputs)
+        except Exception as e:
+            return JsonResponse({"error": f"Criterion classification failed: {e}"}, status=500)
+
+        # Map classification results by criterion name.
+        nature_by_name: Dict[str, Any] = {}
+        for item in nature_batch.items:
+            nature_by_name[item.criterion_name] = item
+
+        # Optional RAG: parse documents (PDFs as base64), build context, pass to research.
+        rag_context = ""
+        documents_raw = data.get("documents") or []
+        if documents_raw:
+            docs_list: List[Tuple[str, bytes]] = []
+            for item in documents_raw:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("filename") or "document.pdf"
+                b64 = item.get("content_base64")
+                if not b64:
+                    continue
+                try:
+                    doc_bytes = base64.b64decode(b64)
+                    if doc_bytes:
+                        docs_list.append((name, doc_bytes))
+                except Exception:
+                    continue
+            if docs_list:
+                try:
+                    rag_context = build_rag_context(
+                        docs_list,
+                        inputs.options,
+                        inputs.criteria,
+                        inputs.problem_description,
+                    )
+                except Exception:
+                    # If RAG fails for any reason (e.g., PDF parsing or embedding issues),
+                    # fall back to running AI research without document context instead
+                    # of failing the entire request.
+                    rag_context = ""
+
+        # Run AI research to get fuzzy scores (with optional RAG context).
+        try:
+            ai_result = run_ai_research(inputs, rag_context=rag_context or None)
+        except Exception as e:
+            return JsonResponse({"error": f"AI research failed: {e}"}, status=500)
+
+        # Serialize scores to a list (JSON does not support tuple keys).
+        scores_list = []
+        for (opt_name, crit_name), score_obj in ai_result.scores.items():
+            scores_list.append(
+                {
+                    "option_name": opt_name,
+                    "criterion_name": crit_name,
+                    "l": score_obj.score_tfn.l,
+                    "m": score_obj.score_tfn.m,
+                    "u": score_obj.score_tfn.u,
+                    "justification": score_obj.justification,
+                }
+            )
+
+        # Serialize criteria with LLM-derived kinds and rationales.
+        criteria_list = []
+        for crit in inputs.criteria:
+            nature = nature_by_name.get(crit.name)
+            kind = crit.kind
+            rationale = ""
+            if nature is not None:
+                kind = nature.kind
+                rationale = nature.rationale
+            criteria_list.append(
+                {
+                    "name": crit.name,
+                    "weight": crit.weight,
+                    "description": crit.description,
+                    "kind": kind,
+                    "rationale": rationale,
+                }
+            )
+
+        return JsonResponse({"scores": scores_list, "criteria": criteria_list})
     except Exception as e:
-        return JsonResponse({"error": f"Criterion classification failed: {e}"}, status=500)
-
-    # Map classification results by criterion name.
-    nature_by_name: Dict[str, Any] = {}
-    for item in nature_batch.items:
-        nature_by_name[item.criterion_name] = item
-
-    # Optional RAG: parse documents (PDFs as base64), build context, pass to research.
-    rag_context = ""
-    documents_raw = data.get("documents") or []
-    if documents_raw:
-        docs_list: List[Tuple[str, bytes]] = []
-        for item in documents_raw:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("filename") or "document.pdf"
-            b64 = item.get("content_base64")
-            if not b64:
-                continue
-            try:
-                doc_bytes = base64.b64decode(b64)
-                if doc_bytes:
-                    docs_list.append((name, doc_bytes))
-            except Exception:
-                continue
-        if docs_list:
-            try:
-                rag_context = build_rag_context(
-                    docs_list,
-                    inputs.options,
-                    inputs.criteria,
-                    inputs.problem_description,
-                )
-            except Exception as e:
-                return JsonResponse({"error": f"RAG context build failed: {e}"}, status=500)
-
-    # Run AI research to get fuzzy scores (with optional RAG context).
-    try:
-        ai_result = run_ai_research(inputs, rag_context=rag_context or None)
-    except Exception as e:
-        return JsonResponse({"error": f"AI research failed: {e}"}, status=500)
-
-    # Serialize scores to a list (JSON does not support tuple keys).
-    scores_list = []
-    for (opt_name, crit_name), score_obj in ai_result.scores.items():
-        scores_list.append({
-            "option_name": opt_name,
-            "criterion_name": crit_name,
-            "l": score_obj.score_tfn.l,
-            "m": score_obj.score_tfn.m,
-            "u": score_obj.score_tfn.u,
-            "justification": score_obj.justification,
-        })
-
-    # Serialize criteria with LLM-derived kinds and rationales.
-    criteria_list = []
-    for crit in inputs.criteria:
-        nature = nature_by_name.get(crit.name)
-        kind = crit.kind
-        rationale = ""
-        if nature is not None:
-            kind = nature.kind
-            rationale = nature.rationale
-        criteria_list.append(
-            {
-                "name": crit.name,
-                "weight": crit.weight,
-                "description": crit.description,
-                "kind": kind,
-                "rationale": rationale,
-            }
+        # Last-resort guard: surface unexpected errors as structured JSON
+        # instead of a generic HTML 500 page.
+        return JsonResponse(
+            {"error": f"Unexpected server error in /api/research/: {e}"},
+            status=500,
         )
-
-    return JsonResponse({"scores": scores_list, "criteria": criteria_list})
 
 
 @csrf_exempt
@@ -206,6 +219,7 @@ def api_calculate(request):
     Body: { problem_description, options: [...], criteria: [...], scores: [{ option_name, criterion_name, l, m, u, justification }] }
     Returns: { winner, loser, explanation, options: [{ option_name, closeness_coefficient, distance_to_fpis, distance_to_fnis }] }
     """
+    print("this function is called")
     data = _parse_json_body(request)
     if data is None:
         return JsonResponse({"error": "Invalid JSON body."}, status=400)

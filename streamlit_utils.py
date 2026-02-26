@@ -11,7 +11,7 @@ def render_footer() -> None:
     st.markdown(
         """
         <div style="text-align: center; margin-top: 3rem; padding: 1rem 0; font-size: 0.85rem; color: #6c757d;">
-            Sayon Jose<br/>
+            Sion Jose<br/>
             <a href="mailto:sionjose2004sj@gmail.com">sionjose2004sj@gmail.com</a><br/>
             7025807399
         </div>

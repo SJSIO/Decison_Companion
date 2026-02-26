@@ -58,7 +58,7 @@ def _api_research(
     criteria: list,
     documents: list | None = None,
 ) -> dict:
-    payload = {
+    payload: dict = {
         "problem_description": problem_description,
         "options": [{"name": o["name"], "description": o.get("description") or ""} for o in options],
         "criteria": [
@@ -72,10 +72,24 @@ def _api_research(
         ],
     }
     if documents:
-        payload["documents"] = [
-            {"filename": f.name, "content_base64": base64.b64encode(f.read()).decode()}
-            for f in documents
-        ]
+        payload["documents"] = []
+        for f in documents:
+            # Ensure we always read from the beginning so repeated research
+            # calls in the same session still send full PDF contents.
+            try:
+                f.seek(0)
+            except Exception:
+                # Some UploadedFile-like objects may not support seek; ignore.
+                pass
+            content = f.read()
+            if not content:
+                continue
+            payload["documents"].append(
+                {
+                    "filename": getattr(f, "name", "document.pdf"),
+                    "content_base64": base64.b64encode(content).decode(),
+                }
+            )
 
     r = requests.post(f"{API_BASE_URL}/api/research/", json=payload, timeout=120)
 
@@ -276,6 +290,7 @@ def main():
     research_disabled = not (goal_valid and options_valid and criteria_valid)
     if st.button("Run AI research", disabled=research_disabled):
         with st.spinner("AI agents researching and validating data..."):
+            success = False
             try:
                 pdf_uploads = st.session_state.get("pdf_uploads") or []
                 result = _api_research(
@@ -295,13 +310,16 @@ def main():
                     kinds[name] = (crit.get("kind") or "benefit").lower()
                 st.session_state.criterion_kinds = kinds
                 st.session_state.edited_scores = {}
-                st.session_state.classification_confirmed = False  # require confirmation before score review
+                # Require fresh confirmation before score review on each successful run.
+                st.session_state.classification_confirmed = False
+                success = True
                 st.success("Research complete. Confirm criteria classification below, then review scores.")
             except requests.RequestException as e:
                 st.error(f"Research request failed: {e}")
             except Exception as e:
                 st.error(str(e))
-        st.rerun()
+        if success:
+            st.rerun()
 
     # ----- Phase 2.5: Criteria classification confirmation -----
     scores = st.session_state.research_scores
