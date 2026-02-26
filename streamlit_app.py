@@ -5,9 +5,12 @@ Ensure Django API is running on API_BASE_URL (default http://localhost:8000).
 """
 from __future__ import annotations
 
+import base64
 import requests
 import streamlit as st
 import pandas as pd
+
+from streamlit_utils import render_footer
 
 API_BASE_URL = "http://localhost:8000"
 
@@ -41,20 +44,60 @@ def _ensure_session_state():
     # Final result
     if "calculate_result" not in st.session_state:
         st.session_state.calculate_result = None
+    if "calculation_intermediates" not in st.session_state:
+        st.session_state.calculation_intermediates = None
+
+    # Gate: show score editors only after user confirms criteria classification
+    if "classification_confirmed" not in st.session_state:
+        st.session_state.classification_confirmed = False
 
 
-def _api_research(problem_description: str, options: list, criteria: list) -> dict:
+def _api_research(
+    problem_description: str,
+    options: list,
+    criteria: list,
+    documents: list | None = None,
+) -> dict:
     payload = {
         "problem_description": problem_description,
         "options": [{"name": o["name"], "description": o.get("description") or ""} for o in options],
         "criteria": [
-            {"name": c["name"], "weight": c["weight"], "description": c.get("description") or "", "kind": c.get("kind") or "benefit"}
+            {
+                "name": c["name"],
+                "weight": c["weight"],
+                "description": c.get("description") or "",
+                "kind": c.get("kind") or "benefit",
+            }
             for c in criteria
         ],
     }
+    if documents:
+        payload["documents"] = [
+            {"filename": f.name, "content_base64": base64.b64encode(f.read()).decode()}
+            for f in documents
+        ]
+
     r = requests.post(f"{API_BASE_URL}/api/research/", json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()
+
+    # Always try to surface the backend's JSON error message ({"error": "..."})
+    # instead of a generic HTTPError string.
+    try:
+        data = r.json()
+    except ValueError:
+        # Non-JSON response from the API.
+        if not r.ok:
+            snippet = (r.text or "").strip()
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            raise RuntimeError(f"API /api/research/ error {r.status_code}: {snippet}")
+        raise RuntimeError("API /api/research/ returned a non-JSON response.")
+
+    if not r.ok:
+        if isinstance(data, dict) and "error" in data:
+            raise RuntimeError(str(data["error"]))
+        raise RuntimeError(f"API /api/research/ error {r.status_code}: {data}")
+
+    return data
 
 
 def _api_calculate(problem_description: str, options: list, criteria: list, scores: list) -> dict:
@@ -62,14 +105,34 @@ def _api_calculate(problem_description: str, options: list, criteria: list, scor
         "problem_description": problem_description,
         "options": [{"name": o["name"], "description": o.get("description") or ""} for o in options],
         "criteria": [
-            {"name": c["name"], "weight": c["weight"], "description": c.get("description") or "", "kind": c.get("kind") or "benefit"}
+            {
+                "name": c["name"],
+                "weight": c["weight"],
+                "description": c.get("description") or "",
+                "kind": c.get("kind") or "benefit",
+            }
             for c in criteria
         ],
         "scores": scores,
     }
     r = requests.post(f"{API_BASE_URL}/api/calculate/", json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()
+
+    try:
+        data = r.json()
+    except ValueError:
+        if not r.ok:
+            snippet = (r.text or "").strip()
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            raise RuntimeError(f"API /api/calculate/ error {r.status_code}: {snippet}")
+        raise RuntimeError("API /api/calculate/ returned a non-JSON response.")
+
+    if not r.ok:
+        if isinstance(data, dict) and "error" in data:
+            raise RuntimeError(str(data["error"]))
+        raise RuntimeError(f"API /api/calculate/ error {r.status_code}: {data}")
+
+    return data
 
 
 def main():
@@ -88,9 +151,22 @@ def main():
         value=st.session_state.problem_description,
         key="overall_goal",
         height=80,
+        placeholder=(
+            "Example: We are evaluating three candidates for a Team Lead role. "
+            "I have uploaded their resumes as PDFs. Please evaluate them based on "
+            "Leadership, System Design, and Communication skills."
+        ),
         help="Describe what you are trying to decide. This is passed to the AI for research and final explanation.",
     )
     st.session_state.problem_description = problem
+
+    st.file_uploader(
+        "Supporting documents (PDF)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="pdf_uploads",
+        help="Optional: upload PDFs (e.g. resumes, reports). The AI will base fuzzy scores on retrieved content from these documents.",
+    )
 
     col_counts = st.columns(2)
     with col_counts[0]:
@@ -201,10 +277,12 @@ def main():
     if st.button("Run AI research", disabled=research_disabled):
         with st.spinner("AI agents researching and validating data..."):
             try:
+                pdf_uploads = st.session_state.get("pdf_uploads") or []
                 result = _api_research(
                     st.session_state.problem_description,
                     st.session_state.options,
                     st.session_state.criteria,
+                    documents=pdf_uploads if pdf_uploads else None,
                 )
                 st.session_state.research_scores = result.get("scores") or []
                 st.session_state.criterion_meta = result.get("criteria") or []
@@ -217,19 +295,47 @@ def main():
                     kinds[name] = (crit.get("kind") or "benefit").lower()
                 st.session_state.criterion_kinds = kinds
                 st.session_state.edited_scores = {}
-                st.success("Research complete. Review and edit scores below.")
+                st.session_state.classification_confirmed = False  # require confirmation before score review
+                st.success("Research complete. Confirm criteria classification below, then review scores.")
             except requests.RequestException as e:
                 st.error(f"Research request failed: {e}")
             except Exception as e:
                 st.error(str(e))
         st.rerun()
 
-    # ----- Phase 3: Human-in-the-loop -----
-    st.header("Phase 3: Review and edit scores (per criterion)")
+    # ----- Phase 2.5: Criteria classification confirmation -----
     scores = st.session_state.research_scores
     criterion_meta = st.session_state.criterion_meta
 
-    if scores and criterion_meta:
+    if scores and criterion_meta and not st.session_state.classification_confirmed:
+        st.header("Phase 2.5: Criteria classification")
+        st.subheader("Are you satisfied with the criteria classification?")
+        st.caption("Review the AI's classification for each criterion. Change any type below, then proceed to score review.")
+        for crit in criterion_meta:
+            crit_name = crit.get("name")
+            if not crit_name:
+                continue
+            crit_kind_llm = (crit.get("kind") or "benefit").lower()
+            crit_rationale = crit.get("rationale") or ""
+            current_kind = st.session_state.criterion_kinds.get(crit_name, crit_kind_llm)
+            kind_index = 0 if current_kind == "benefit" else 1
+            selected = st.selectbox(
+                f"**{crit_name}** — AI suggested: {crit_kind_llm}",
+                options=["benefit", "cost"],
+                index=kind_index,
+                key=f"criterion_kind_confirm_{crit_name}",
+            )
+            st.session_state.criterion_kinds[crit_name] = selected
+            if crit_rationale:
+                st.caption(f"Rationale: {crit_rationale}")
+        if st.button("Yes, proceed to score review"):
+            st.session_state.classification_confirmed = True
+            st.rerun()
+
+    # ----- Phase 3: Human-in-the-loop (score editors) -----
+    if scores and criterion_meta and st.session_state.classification_confirmed:
+        st.header("Phase 3: Review and edit scores (per criterion)")
+
         # Render one editor per criterion
         for crit in criterion_meta:
             crit_name = crit.get("name")
@@ -285,14 +391,14 @@ def main():
                 },
             )
             st.session_state.edited_scores[crit_name] = edited_df
-    else:
+    elif not (scores and criterion_meta):
         st.info("Run AI research first to see per-criterion score tables.")
 
     # ----- Phase 4: Calculation -----
     st.header("Phase 4: Final decision")
-    can_calculate = bool(scores and criterion_meta)
+    can_calculate = bool(scores and criterion_meta and st.session_state.classification_confirmed)
     if not can_calculate:
-        st.info("You must run AI research and review scores before running the final decision.")
+        st.info("You must run AI research, confirm criteria classification, and review scores before running the final decision.")
     else:
         if st.button("Run final decision"):
             # Flatten per-criterion edited tables into a single scores list.
@@ -354,6 +460,7 @@ def main():
                         scores_payload,
                     )
                     st.session_state.calculate_result = calc
+                    st.session_state.calculation_intermediates = calc.get("intermediates")
                     st.success("Calculation complete.")
                 except requests.RequestException as e:
                     st.error(f"Calculation request failed: {e}")
@@ -383,6 +490,13 @@ def main():
             cc_df = pd.DataFrame(options_cc)
             cc_df = cc_df.sort_values("closeness_coefficient", ascending=False).reset_index(drop=True)
             st.bar_chart(cc_df.set_index("option_name")["closeness_coefficient"])
+
+        if st.session_state.calculation_intermediates:
+            st.markdown("---")
+            if st.button("View Detailed Mathematical Breakdown"):
+                st.switch_page("pages/algorithm_explanation.py")
+
+    render_footer()
 
 
 if __name__ == "__main__":

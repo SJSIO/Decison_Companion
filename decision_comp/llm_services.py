@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -77,10 +77,15 @@ def get_llm(model_name: str = "llama-3.3-70b-versatile") -> ChatGroq:
     )
 
 
-def run_research_llm(decision_input: DecisionInputState) -> ResearchBatchOutput:
+def run_research_llm(
+    decision_input: DecisionInputState,
+    rag_context: Optional[str] = None,
+) -> ResearchBatchOutput:
     """
     Call the Groq Llama model to research each option against each criterion.
     Returns a strictly validated ResearchBatchOutput with fuzzy scores (TFNs).
+    If rag_context is provided (from RAG over uploaded PDFs), the model MUST base
+    its triangular fuzzy scores (l, m, u) and justifications ONLY on that context.
     """
     llm = get_llm()
 
@@ -91,10 +96,21 @@ def run_research_llm(decision_input: DecisionInputState) -> ResearchBatchOutput:
         "A triangular fuzzy score is represented as three floats (l, m, u) where:\n"
         "- 1.0 <= l <= m <= u <= 10.0\n"
         "- l is the worst-case score, m is the most-likely score, and u is the best-case score.\n"
-        "Base your answers only on widely accepted facts and the descriptions provided. "
-        "If information is unclear, make a conservative, clearly justified estimate, and widen the "
-        "fuzzy range to reflect uncertainty."
     )
+    if rag_context and rag_context.strip():
+        system_prompt += (
+            "You have been provided with RELEVANT DOCUMENT EXCERPTS below. You MUST base your "
+            "triangular fuzzy scores (l, m, u) and justifications STRICTLY on the information in "
+            "those excerpts only. Do NOT use general knowledge or speculation. If the excerpts "
+            "do not contain enough information for a given (option, criterion) pair, make a "
+            "conservative, clearly justified estimate and widen the fuzzy range to reflect uncertainty.\n\n"
+        )
+    else:
+        system_prompt += (
+            "Base your answers only on widely accepted facts and the descriptions provided. "
+            "If information is unclear, make a conservative, clearly justified estimate, and widen the "
+            "fuzzy range to reflect uncertainty.\n"
+        )
 
     # Flatten options and criteria into an explicit, index-based description
     # that the model can follow without renaming anything.
@@ -117,6 +133,15 @@ def run_research_llm(decision_input: DecisionInputState) -> ResearchBatchOutput:
         f"Decision problem:\n{decision_input.problem_description}\n\n"
         f"Options (indexed by option_index):\n{options_block}\n\n"
         f"Criteria (indexed by criterion_index):\n{criteria_block}\n\n"
+    )
+    if rag_context and rag_context.strip():
+        user_prompt += (
+            "Relevant document excerpts (base your scores and justifications ONLY on this text):\n"
+            "---\n"
+            f"{rag_context.strip()}\n"
+            "---\n\n"
+        )
+    user_prompt += (
         "You MUST create one item for EVERY possible combination of option_index "
         "and criterion_index.\n"
         "For each item, you MUST output exactly:\n"

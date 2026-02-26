@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 from langgraph.graph import StateGraph, END
 
@@ -23,7 +23,7 @@ def ai_research_node(state: GraphState) -> GraphState:
     if state.inputs is None:
         raise ValueError("GraphState.inputs must be set before calling ai_research_node.")
 
-    research_output = run_research_llm(state.inputs)
+    research_output = run_research_llm(state.inputs, rag_context=state.rag_context)
 
     scores: Dict[Tuple[str, str], OptionCriterionScore] = {}
 
@@ -190,12 +190,56 @@ def _distance_between_tfn(
     ) ** 0.5
 
 
+def _serialize_intermediates(
+    inputs: DecisionInputState,
+    normalized: Dict[Tuple[str, str], NormalizedTriangularFuzzyNumber],
+    weighted: Dict[Tuple[str, str], WeightedTriangularFuzzyNumber],
+    fpis: Dict[str, WeightedTriangularFuzzyNumber],
+    fnis: Dict[str, WeightedTriangularFuzzyNumber],
+    option_results: List[FuzzyOptionResult],
+) -> Dict[str, Any]:
+    """Build a JSON-serializable dict of TOPSIS intermediates for the algorithm explanation page."""
+    normalized_matrix = []
+    for opt in inputs.options:
+        for crit in inputs.criteria:
+            key = (opt.name, crit.name)
+            if key in normalized:
+                n = normalized[key]
+                normalized_matrix.append({"option_name": opt.name, "criterion_name": crit.name, "l": n.l, "m": n.m, "u": n.u})
+    weighted_matrix = []
+    for opt in inputs.options:
+        for crit in inputs.criteria:
+            key = (opt.name, crit.name)
+            if key in weighted:
+                w = weighted[key]
+                weighted_matrix.append({"option_name": opt.name, "criterion_name": crit.name, "l": w.l, "m": w.m, "u": w.u})
+    fpis_out = {crit.name: {"l": fpis[crit.name].l, "m": fpis[crit.name].m, "u": fpis[crit.name].u} for crit in inputs.criteria}
+    fnis_out = {crit.name: {"l": fnis[crit.name].l, "m": fnis[crit.name].m, "u": fnis[crit.name].u} for crit in inputs.criteria}
+    options_out = [
+        {
+            "option_name": o.option_name,
+            "closeness_coefficient": o.closeness_coefficient,
+            "distance_to_fpis": o.distance_to_fpis,
+            "distance_to_fnis": o.distance_to_fnis,
+        }
+        for o in option_results
+    ]
+    return {
+        "normalized_matrix": normalized_matrix,
+        "weighted_matrix": weighted_matrix,
+        "fpis": fpis_out,
+        "fnis": fnis_out,
+        "options": options_out,
+    }
+
+
 def compute_fuzzy_topsis(
     inputs: DecisionInputState,
     final_scores: FinalScoresState,
-) -> FuzzyTopsisResult:
+) -> Tuple[FuzzyTopsisResult, Dict[str, Any]]:
     """
     Deterministic Fuzzy TOPSIS implementation using triangular fuzzy numbers.
+    Returns (result, intermediates_dict) for the algorithm explanation page.
     """
     # Ensure all required scores are present.
     for opt in inputs.options:
@@ -208,7 +252,7 @@ def compute_fuzzy_topsis(
     weighted = _apply_weights(normalized, inputs)
     fpis, fnis = _compute_fpis_fnis(weighted, inputs)
 
-    option_results: Dict[str, FuzzyOptionResult] = {}
+    option_results_list: List[FuzzyOptionResult] = []
 
     for opt in inputs.options:
         d_plus = 0.0
@@ -225,22 +269,26 @@ def compute_fuzzy_topsis(
         else:
             cc = d_minus / denom
 
-        option_results[opt.name] = FuzzyOptionResult(
-            option_name=opt.name,
-            distance_to_fpis=d_plus,
-            distance_to_fnis=d_minus,
-            closeness_coefficient=cc,
+        option_results_list.append(
+            FuzzyOptionResult(
+                option_name=opt.name,
+                distance_to_fpis=d_plus,
+                distance_to_fnis=d_minus,
+                closeness_coefficient=cc,
+            )
         )
 
     sorted_options = sorted(
-        option_results.values(),
+        option_results_list,
         key=lambda o: (-o.closeness_coefficient, o.option_name),
     )
 
     winner = sorted_options[0].option_name
     loser = sorted_options[-1].option_name if len(sorted_options) > 1 else None
+    result = FuzzyTopsisResult(options=sorted_options, winner=winner, loser=loser)
 
-    return FuzzyTopsisResult(options=sorted_options, winner=winner, loser=loser)
+    intermediates = _serialize_intermediates(inputs, normalized, weighted, fpis, fnis, sorted_options)
+    return result, intermediates
 
 
 def fuzzy_topsis_calculation_node(state: GraphState) -> GraphState:
@@ -249,7 +297,8 @@ def fuzzy_topsis_calculation_node(state: GraphState) -> GraphState:
             "GraphState.inputs and GraphState.final_scores must be set before calling fuzzy_topsis_calculation_node."
         )
 
-    state.topsis_result = compute_fuzzy_topsis(state.inputs, state.final_scores)
+    result, _ = compute_fuzzy_topsis(state.inputs, state.final_scores)
+    state.topsis_result = result
     return state
 
 
@@ -283,12 +332,17 @@ def build_decision_graph() -> StateGraph:
     return graph
 
 
-def run_ai_research(inputs: DecisionInputState) -> AIResearchResultState:
+def run_ai_research(
+    inputs: DecisionInputState,
+    rag_context: str | None = None,
+) -> AIResearchResultState:
     """
     Convenience function: run only the AI research node.
-    Intended to be called from the CLI before the human-in-the-loop step.
+    Intended to be called from the CLI or API before the human-in-the-loop step.
+    If rag_context is provided (e.g. from RAG over uploaded PDFs), the research LLM
+    will base fuzzy scores strictly on that context.
     """
-    state = GraphState(inputs=inputs)
+    state = GraphState(inputs=inputs, rag_context=rag_context)
     updated_state = ai_research_node(state)
     if updated_state.ai_scores is None:
         raise RuntimeError("AI research did not produce any scores.")
@@ -298,14 +352,15 @@ def run_ai_research(inputs: DecisionInputState) -> AIResearchResultState:
 def run_calculation_and_synthesis(
     inputs: DecisionInputState,
     final_scores: FinalScoresState,
-) -> Tuple[FuzzyTopsisResult, str]:
+) -> Tuple[FuzzyTopsisResult, str, Dict[str, Any]]:
     """
     Convenience function: run deterministic Fuzzy TOPSIS calculation and synthesis explanation.
+    Returns (topsis_result, explanation, intermediates) for the algorithm explanation page.
     """
-    state = GraphState(inputs=inputs, final_scores=final_scores)
-    state = fuzzy_topsis_calculation_node(state)
+    topsis_result, intermediates = compute_fuzzy_topsis(inputs, final_scores)
+    state = GraphState(inputs=inputs, final_scores=final_scores, topsis_result=topsis_result)
     state = synthesis_node(state)
-    if state.topsis_result is None or state.explanation is None:
+    if state.explanation is None:
         raise RuntimeError("Calculation and synthesis did not complete successfully.")
-    return state.topsis_result, state.explanation
+    return topsis_result, state.explanation, intermediates
 

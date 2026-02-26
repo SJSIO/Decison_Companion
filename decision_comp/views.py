@@ -4,6 +4,7 @@ Streamlit (or other clients) call these to run research and calculation.
 """
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, Dict, List, Tuple
 
@@ -13,6 +14,7 @@ from django.views.decorators.http import require_http_methods
 
 from .graph import run_ai_research, run_calculation_and_synthesis
 from .llm_services import classify_criteria_nature
+from .rag import build_rag_context
 from .models import (
     CriterionSchema,
     DecisionInputState,
@@ -127,9 +129,38 @@ def api_research(request):
     for item in nature_batch.items:
         nature_by_name[item.criterion_name] = item
 
-    # Run AI research to get fuzzy scores.
+    # Optional RAG: parse documents (PDFs as base64), build context, pass to research.
+    rag_context = ""
+    documents_raw = data.get("documents") or []
+    if documents_raw:
+        docs_list: List[Tuple[str, bytes]] = []
+        for item in documents_raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("filename") or "document.pdf"
+            b64 = item.get("content_base64")
+            if not b64:
+                continue
+            try:
+                doc_bytes = base64.b64decode(b64)
+                if doc_bytes:
+                    docs_list.append((name, doc_bytes))
+            except Exception:
+                continue
+        if docs_list:
+            try:
+                rag_context = build_rag_context(
+                    docs_list,
+                    inputs.options,
+                    inputs.criteria,
+                    inputs.problem_description,
+                )
+            except Exception as e:
+                return JsonResponse({"error": f"RAG context build failed: {e}"}, status=500)
+
+    # Run AI research to get fuzzy scores (with optional RAG context).
     try:
-        ai_result = run_ai_research(inputs)
+        ai_result = run_ai_research(inputs, rag_context=rag_context or None)
     except Exception as e:
         return JsonResponse({"error": f"AI research failed: {e}"}, status=500)
 
@@ -194,7 +225,7 @@ def api_calculate(request):
         return JsonResponse({"error": f"Invalid score data: {e}"}, status=400)
 
     try:
-        topsis_result, explanation = run_calculation_and_synthesis(inputs, final_scores)
+        topsis_result, explanation, intermediates = run_calculation_and_synthesis(inputs, final_scores)
     except Exception as e:
         return JsonResponse({"error": f"Calculation and synthesis failed: {e}"}, status=500)
 
@@ -213,4 +244,5 @@ def api_calculate(request):
         "loser": topsis_result.loser,
         "explanation": explanation,
         "options": options_out,
+        "intermediates": intermediates,
     })

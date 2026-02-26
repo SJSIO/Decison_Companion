@@ -179,4 +179,5 @@ class GraphState(StrictBaseModel):
     final_scores: Optional[FinalScoresState] = None
     topsis_result: Optional[FuzzyTopsisResult] = None
     explanation: Optional[str] = None
+    rag_context: Optional[str] = None
 
