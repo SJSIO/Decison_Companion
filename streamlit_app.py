@@ -52,6 +52,16 @@ def _ensure_session_state():
         st.session_state.classification_confirmed = False
 
 
+def _reset_decision_state() -> None:
+    """
+    Clear the current decision so the user can start a new one.
+    Keeps num_options and num_criteria so counts are preserved.
+    """
+    # Defer actual reset until the next run, before widgets are created.
+    # This avoids modifying widget-managed keys (like pdf_uploads) after instantiation.
+    st.session_state._reset_decision_requested = True
+
+
 def _api_research(
     problem_description: str,
     options: list,
@@ -151,6 +161,26 @@ def _api_calculate(problem_description: str, options: list, criteria: list, scor
 
 def main():
     _ensure_session_state()
+
+    # Apply a pending reset (triggered from the previous run) *before* any widgets are instantiated.
+    if st.session_state.get("_reset_decision_requested"):
+        # Core decision definition (keep counts as-is)
+        st.session_state.problem_description = ""
+        st.session_state.options = []
+        st.session_state.criteria = []
+
+        # Research + human-in-the-loop state
+        st.session_state.research_scores = []
+        st.session_state.criterion_meta = []
+        st.session_state.criterion_kinds = {}
+        st.session_state.edited_scores = {}
+        st.session_state.classification_confirmed = False
+
+        # Final result
+        st.session_state.calculate_result = None
+        st.session_state.calculation_intermediates = None
+
+        st.session_state._reset_decision_requested = False
 
     st.set_page_config(page_title="Decision Companion", layout="wide")
     st.title("Decision Companion")
@@ -509,10 +539,20 @@ def main():
             cc_df = cc_df.sort_values("closeness_coefficient", ascending=False).reset_index(drop=True)
             st.bar_chart(cc_df.set_index("option_name")["closeness_coefficient"])
 
+        st.markdown("---")
         if st.session_state.calculation_intermediates:
-            st.markdown("---")
-            if st.button("View Detailed Mathematical Breakdown"):
-                st.switch_page("pages/algorithm_explanation.py")
+            col_breakdown, col_new_decision = st.columns(2)
+            with col_breakdown:
+                if st.button("View Detailed Mathematical Breakdown"):
+                    st.switch_page("pages/algorithm_explanation.py")
+            with col_new_decision:
+                if st.button("Run another decision"):
+                    _reset_decision_state()
+                    st.rerun()
+        else:
+            if st.button("Run another decision"):
+                _reset_decision_state()
+                st.rerun()
 
     render_footer()
 
