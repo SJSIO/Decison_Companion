@@ -182,8 +182,8 @@ def main():
 
         st.session_state._reset_decision_requested = False
 
-    st.set_page_config(page_title="Decision Companion", layout="wide")
-    st.title("Decision Companion")
+    st.set_page_config(page_title="Run Your Decision", layout="wide")
+    st.title("Run Your Decision")
     st.caption("Define options and criteria, run AI research, edit fuzzy scores, then run the final decision.")
 
     # ----- Phase 1: Dynamic decision inputs -----
@@ -366,14 +366,14 @@ def main():
             crit_kind_llm = (crit.get("kind") or "benefit").lower()
             crit_rationale = crit.get("rationale") or ""
             current_kind = st.session_state.criterion_kinds.get(crit_name, crit_kind_llm)
-            kind_index = 0 if current_kind == "benefit" else 1
+            kind_index = 0 if (str(current_kind).strip().lower() or "benefit") == "benefit" else 1
             selected = st.selectbox(
-                f"**{crit_name}** — AI suggested: {crit_kind_llm}",
-                options=["benefit", "cost"],
+                f"**{crit_name}** — AI suggested: {(crit_kind_llm or 'benefit').capitalize()}",
+                options=["Benefit", "Cost"],
                 index=kind_index,
                 key=f"criterion_kind_confirm_{crit_name}",
             )
-            st.session_state.criterion_kinds[crit_name] = selected
+            st.session_state.criterion_kinds[crit_name] = selected.lower()
             if crit_rationale:
                 st.caption(f"Rationale: {crit_rationale}")
         if st.button("Yes, proceed to score review"):
@@ -398,16 +398,16 @@ def main():
             if crit_desc:
                 st.caption(crit_desc)
 
-            # Benefit/cost selectbox with AI guess as default
+            # Benefit/Cost selectbox with AI guess as default
             current_kind = st.session_state.criterion_kinds.get(crit_name, crit_kind_llm)
-            kind_index = 0 if current_kind == "benefit" else 1
+            kind_index = 0 if (str(current_kind).strip().lower() or "benefit") == "benefit" else 1
             selected_kind = st.selectbox(
-                "Criterion type (benefit/cost)",
-                options=["benefit", "cost"],
+                "Criterion type (Benefit/Cost)",
+                options=["Benefit", "Cost"],
                 index=kind_index,
                 key=f"criterion_kind_{crit_name}",
             )
-            st.session_state.criterion_kinds[crit_name] = selected_kind
+            st.session_state.criterion_kinds[crit_name] = selected_kind.lower()
 
             if crit_rationale:
                 st.caption(f"LLM rationale: {crit_rationale}")
@@ -489,7 +489,7 @@ def main():
                         "name": name,
                         "weight": crit["weight"],
                         "description": crit.get("description") or "",
-                        "kind": kind_override,
+                        "kind": (kind_override or "benefit").lower(),
                     }
                 )
 
@@ -544,7 +544,7 @@ def main():
             col_breakdown, col_new_decision = st.columns(2)
             with col_breakdown:
                 if st.button("View Detailed Mathematical Breakdown"):
-                    st.switch_page("pages/algorithm_explanation.py")
+                    st.switch_page("pages/How_this_Algorithm_works.py")
             with col_new_decision:
                 if st.button("Run another decision"):
                     _reset_decision_state()

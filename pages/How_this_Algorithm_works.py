@@ -10,7 +10,6 @@ import pandas as pd
 
 from streamlit_utils import render_footer
 
-
 def _section1_static_explanation():
     st.header("Section 1: How Fuzzy TOPSIS Works")
     st.markdown(
@@ -65,8 +64,19 @@ def _section2_dynamic_breakdown():
     options_list = intermediates.get("options") or []
     winner = (calculate_result or {}).get("winner") or (options_list[0]["option_name"] if options_list else None)
 
+    st.markdown(
+        "Below is the step-by-step flow for your run. **Step 1:** Raw fuzzy scores were normalized "
+        "so every value lies in [0, 1] (Benefit criteria: divide by max; Cost criteria: flip and scale). "
+        "**Step 2:** Normalized values were multiplied by each criterion's weight. **Step 3:** The "
+        "positive ideal (FPIS) and negative ideal (FNIS) were computed from the weighted matrix. "
+        "**Step 4:** For each option, distances to FPIS and FNIS were calculated; then the closeness "
+        "coefficient (CC) = distance_to_FNIS / (distance_to_FPIS + distance_to_FNIS). **Step 5:** "
+        "The option with the highest CC is closest to the ideal and is the winner."
+    )
+    st.markdown("---")
+
     # Normalized matrix
-    st.subheader("Normalized matrix (values in [0, 1])")
+    st.subheader("Step 1: Normalized matrix (values in [0, 1])")
     norm = intermediates.get("normalized_matrix") or []
     if norm:
         st.dataframe(pd.DataFrame(norm), use_container_width=True)
@@ -74,7 +84,7 @@ def _section2_dynamic_breakdown():
         st.caption("No normalized matrix data.")
 
     # Weighted matrix
-    st.subheader("Weighted matrix (normalized × criterion weight)")
+    st.subheader("Step 2: Weighted matrix (normalized × criterion weight)")
     wgt = intermediates.get("weighted_matrix") or []
     if wgt:
         st.dataframe(pd.DataFrame(wgt), use_container_width=True)
@@ -82,7 +92,7 @@ def _section2_dynamic_breakdown():
         st.caption("No weighted matrix data.")
 
     # FPIS and FNIS
-    st.subheader("Positive ideal (FPIS) and negative ideal (FNIS)")
+    st.subheader("Step 3: Positive ideal (FPIS) and negative ideal (FNIS)")
     fpis = intermediates.get("fpis") or {}
     fnis = intermediates.get("fnis") or {}
     if fpis or fnis:
@@ -99,7 +109,7 @@ def _section2_dynamic_breakdown():
         st.caption("No FPIS/FNIS data.")
 
     # Distances and closeness coefficients
-    st.subheader("Distances and closeness coefficients")
+    st.subheader("Step 4 & 5: Distances and closeness coefficients")
     if options_list:
         df_cc = pd.DataFrame(options_list)
         df_cc = df_cc.sort_values("closeness_coefficient", ascending=False).reset_index(drop=True)
@@ -114,8 +124,8 @@ def _section2_dynamic_breakdown():
 
 
 def main():
-    st.set_page_config(page_title="Algorithm Explanation | Decision Companion", layout="wide")
-    st.title("Detailed Mathematical Breakdown")
+    st.set_page_config(page_title="How this Algorithm works?", layout="wide")
+    st.title("How this Algorithm works?")
     st.caption("Understand how Fuzzy TOPSIS computed the winning option.")
 
     _section1_static_explanation()

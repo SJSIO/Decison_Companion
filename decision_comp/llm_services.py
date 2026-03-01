@@ -5,7 +5,7 @@ from typing import List, Literal, Optional
 
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .models import DecisionInputState, FuzzyTopsisResult, TriangularFuzzyNumber
 
@@ -40,6 +40,42 @@ class OptionCriterionAIResearch(StrictBaseModel):
 
 class ResearchBatchOutput(StrictBaseModel):
     items: List[OptionCriterionAIResearch]
+
+
+class ResearchItemLLMOutput(StrictBaseModel):
+    """
+    Raw LLM output for one (option, criterion) pair: requires chain-of-thought
+    extracted_evidence and forbids fallback phrasing. Converted to OptionCriterionAIResearch
+    before returning from run_research_llm.
+    """
+    option_index: int = Field(..., ge=0)
+    criterion_index: int = Field(..., ge=0)
+    extracted_evidence: str = Field(
+        ...,
+        min_length=1,
+        description="1-2 exact phrases or concepts from the context that relate to the criterion.",
+    )
+    lower_bound: float = Field(..., ge=1.0, le=10.0, description="Worst-case score.")
+    most_likely: float = Field(..., ge=1.0, le=10.0, description="Most realistic score.")
+    upper_bound: float = Field(..., ge=1.0, le=10.0, description="Best-case score.")
+    justification: str = Field(..., min_length=1)
+
+    @field_validator("extracted_evidence", "justification")
+    def strip_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Must not be empty.")
+        return v.strip()
+
+    @model_validator(mode="after")
+    def bounds_ordered(self) -> "ResearchItemLLMOutput":
+        if not (self.lower_bound <= self.most_likely <= self.upper_bound):
+            raise ValueError("Require lower_bound <= most_likely <= upper_bound.")
+        return self
+
+
+class ResearchBatchOutputLLM(StrictBaseModel):
+    """LLM-structured output with extracted_evidence per item; converted to ResearchBatchOutput."""
+    items: List[ResearchItemLLMOutput]
 
 
 class SynthesisOutput(StrictBaseModel):
@@ -83,34 +119,44 @@ def run_research_llm(
 ) -> ResearchBatchOutput:
     """
     Call the Groq Llama model to research each option against each criterion.
-    Returns a strictly validated ResearchBatchOutput with fuzzy scores (TFNs).
-    If rag_context is provided (from RAG over uploaded PDFs), the model MUST base
-    its triangular fuzzy scores (l, m, u) and justifications ONLY on that context.
+    Uses a universal Expert Analyst persona: infers scores from document context and
+    broad knowledge; forbids \"not known\" / \"insufficient data\"; injects the user's
+    criterion description so scoring matches what the user cares about. Returns a
+    strictly validated ResearchBatchOutput with triangular fuzzy scores (l, m, u).
     """
     llm = get_llm()
 
     system_prompt = (
-        "You are an analytical assistant helping evaluate decision options. "
-        "For every combination of option and criterion, you must assign a TRIANGULAR FUZZY score "
-        "on a 1–10 scale and provide a concise, factual, one-sentence justification.\n\n"
-        "A triangular fuzzy score is represented as three floats (l, m, u) where:\n"
-        "- 1.0 <= l <= m <= u <= 10.0\n"
-        "- l is the worst-case score, m is the most-likely score, and u is the best-case score.\n"
+        "You are an Expert Analyst and Strategic Decision Consultant. Your job is to objectively "
+        "evaluate specific options based on provided documentation and your broad industry knowledge. "
+        "You work in any domain: vendor contracts, candidates, products, strategies, or any other "
+        "decision with options and criteria. For each (option, criterion) pair, use the option name, "
+        "the criterion name, and the USER'S DEFINITION of that criterion (provided in the task). "
+        "Score strictly according to what the user means by that criterion.\n\n"
+        "INSTRUCTIONS AND RULES:\n"
+        "1. DEDUCE AND INFER: Documents rarely state perfect answers explicitly. You are STRICTLY "
+        "FORBIDDEN from outputting \"not known\", \"not mentioned\", \"insufficient data\", \"lack of "
+        "description\", or \"not explicitly mentioned\". You MUST use your expert knowledge to infer "
+        "how well this option performs based on the provided context.\n"
+        "   - Example: If evaluating a software tool for \"Security\" and the context mentions "
+        "\"SOC2 compliance and end-to-end encryption\", infer a high score even if the word "
+        "\"Security\" is not explicitly written.\n"
+        "   - Example: If the criterion is \"Cost\" and the user's definition is \"Lowest long-term "
+        "maintenance fee\", score based on maintenance-related evidence, not just upfront price.\n"
+        "2. TRIANGULAR FUZZY SCORING: Output a Triangular Fuzzy Number (l, m, u) on a scale of 1 to 10. "
+        "lower_bound (l) = worst-case / most pessimistic; most_likely (m) = most realistic; "
+        "upper_bound (u) = best-case / most optimistic. Require l <= m <= u.\n"
+        "3. SPARSE CONTEXT: If the context is truly sparse for an option, infer a reasonable baseline "
+        "based on the nature of the option and the criterion, and widen your confidence range "
+        "(e.g. output a broader triangle like 3, 5, 8). Do not default to the middle; commit to a "
+        "plausible range.\n"
+        "4. JUSTIFICATION: Provide a 1–2 sentence justification that references the provided text "
+        "or your logical deduction. For extracted_evidence, use 1–2 exact phrases from the context "
+        "when available; if inferring from thin context, briefly state the inference basis.\n\n"
+        "OUTPUT: Return one item per (option_index, criterion_index) with extracted_evidence, "
+        "lower_bound, most_likely, upper_bound, and justification. Never refuse to score; always "
+        "produce a defensible fuzzy score and justification.\n"
     )
-    if rag_context and rag_context.strip():
-        system_prompt += (
-            "You have been provided with RELEVANT DOCUMENT EXCERPTS below. You MUST base your "
-            "triangular fuzzy scores (l, m, u) and justifications STRICTLY on the information in "
-            "those excerpts only. Do NOT use general knowledge or speculation. If the excerpts "
-            "do not contain enough information for a given (option, criterion) pair, make a "
-            "conservative, clearly justified estimate and widen the fuzzy range to reflect uncertainty.\n\n"
-        )
-    else:
-        system_prompt += (
-            "Base your answers only on widely accepted facts and the descriptions provided. "
-            "If information is unclear, make a conservative, clearly justified estimate, and widen the "
-            "fuzzy range to reflect uncertainty.\n"
-        )
 
     # Flatten options and criteria into an explicit, index-based description
     # that the model can follow without renaming anything.
@@ -123,9 +169,10 @@ def run_research_llm(
 
     criteria_block_lines = []
     for idx, crit in enumerate(decision_input.criteria):
+        user_def = (crit.description or "").strip() or "Not specified; use the criterion name and context."
         criteria_block_lines.append(
-            f"{idx}: {crit.name} (weight {crit.weight}/10) - "
-            f"{crit.description or 'No additional description.'}"
+            f"Criterion {idx}: **{crit.name}** (weight {crit.weight}/10). "
+            f"**User's description of this criterion:** {user_def}"
         )
     criteria_block = "\n".join(criteria_block_lines)
 
@@ -136,34 +183,48 @@ def run_research_llm(
     )
     if rag_context and rag_context.strip():
         user_prompt += (
-            "Relevant document excerpts (base your scores and justifications ONLY on this text):\n"
-            "---\n"
+            "Here is the factual context retrieved from the user's uploaded documents:\n"
+            "<context>\n"
             f"{rag_context.strip()}\n"
-            "---\n\n"
+            "</context>\n\n"
+            "Score like an objective evaluator: for each criterion, options with clear supporting "
+            "evidence in the context must receive higher fuzzy scores (l, m, u); options with no or "
+            "weak evidence must receive lower scores. Use the User's Definition of each criterion to "
+            "decide what counts as evidence.\n\n"
+            "If the context is grouped by 'Context for Option 0', 'Context for Option 1', etc., use "
+            "only the section for that option when scoring that option — do not use another option's "
+            "context.\n\n"
         )
     user_prompt += (
-        "You MUST create one item for EVERY possible combination of option_index "
-        "and criterion_index.\n"
-        "For each item, you MUST output exactly:\n"
-        "- option_index (integer, matching one of the listed option indices)\n"
-        "- criterion_index (integer, matching one of the listed criterion indices)\n"
-        "- score: a triangular fuzzy score represented as three floats (l, m, u) on the 1–10 scale,\n"
-        "         where 1.0 <= l <= m <= u <= 10.0\n"
-        "- justification (ONE factual sentence)\n\n"
-        "Example item (for illustration only):\n"
+        "You MUST create one item for EVERY possible combination of option_index and criterion_index. "
+        "For each item return:\n"
+        "- option_index (integer)\n"
+        "- criterion_index (integer)\n"
+        "- extracted_evidence: 1–2 exact phrases or concepts from the context that relate to the "
+        "criterion; if context is sparse, state the inference basis in a short phrase (e.g. \"Inferred "
+        "from SLA and uptime guarantees\")\n"
+        "- lower_bound: float 1–10 (worst-case)\n"
+        "- most_likely: float 1–10 (most realistic)\n"
+        "- upper_bound: float 1–10 (best-case); must have lower_bound <= most_likely <= upper_bound\n"
+        "- justification: 1–2 sentences that reference the provided text or your logical deduction. "
+        "Do NOT say the information is missing or unknown.\n\n"
+        "Example item:\n"
         "{\n"
         '  \"option_index\": 0,\n'
         '  \"criterion_index\": 1,\n'
-        '  \"score\": {\"l\": 7.0, \"m\": 8.0, \"u\": 9.0},\n'
-        '  \"justification\": \"Option 0 scores well on criterion 1 based on reliability and support.\"\n'
+        '  \"extracted_evidence\": \"SOC2 Type II; encryption at rest and in transit\",\n'
+        '  \"lower_bound\": 7.0,\n'
+        '  \"most_likely\": 8.5,\n'
+        '  \"upper_bound\": 9.0,\n'
+        '  \"justification\": \"Compliance and encryption signals strongly support a high security score.\"\n'
         "}\n\n"
-        "Do NOT rename options or criteria. Do NOT omit any combinations. Ensure that you "
-        "respect the fuzzy score constraints for every item."
+        "Do NOT omit any combinations. Do NOT output \"not known\", \"not mentioned\", \"insufficient "
+        "data\", or \"lack of description\". Always produce a defensible score and justification.\n"
     )
 
     try:
-        structured_llm = llm.with_structured_output(ResearchBatchOutput)
-        result: ResearchBatchOutput = structured_llm.invoke(
+        structured_llm = llm.with_structured_output(ResearchBatchOutputLLM)
+        raw_result: ResearchBatchOutputLLM = structured_llm.invoke(
             [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
         )
     except ValidationError as ve:
@@ -171,11 +232,32 @@ def run_research_llm(
     except Exception as exc:
         raise RuntimeError(f"Error while calling research LLM: {exc}") from exc
 
+    # Convert LLM output (extracted_evidence, lower_bound, most_likely, upper_bound) to pipeline
+    # format (score as TriangularFuzzyNumber, justification). Optionally fold extracted_evidence
+    # into justification so the user sees it.
+    items: List[OptionCriterionAIResearch] = []
+    for raw in raw_result.items or []:
+        score_tfn = TriangularFuzzyNumber(
+            l=raw.lower_bound,
+            m=raw.most_likely,
+            u=raw.upper_bound,
+        )
+        justification = raw.justification
+        if raw.extracted_evidence.strip():
+            justification = f"[Evidence: {raw.extracted_evidence.strip()}] {justification}"
+        items.append(
+            OptionCriterionAIResearch(
+                option_index=raw.option_index,
+                criterion_index=raw.criterion_index,
+                score=score_tfn,
+                justification=justification.strip(),
+            )
+        )
+    result = ResearchBatchOutput(items=items)
+
     # Additional safety: ensure we have exactly one item per (option, criterion)
-    # pair, with no duplicates and all indices in range. If this check fails,
-    # the caller (CLI) can fall back to full manual scoring.
+    # pair, with no duplicates and all indices in range.
     expected_items = len(decision_input.options) * len(decision_input.criteria)
-    items = result.items or []
 
     if len(items) != expected_items:
         raise RuntimeError(
@@ -260,13 +342,24 @@ def run_synthesis_llm(
         "You are an explanation engine. You are given a decision problem, "
         "options, criteria with weights, fuzzy scores (as triangular fuzzy numbers), "
         "and the results of a Fuzzy TOPSIS calculation.\n\n"
-        "You MUST produce a markdown explanation with TWO sections, in this order:\n"
+        "You MUST produce a markdown explanation with TWO sections, in this order:\n\n"
         "## Algorithmic Breakdown\n"
-        "- Explain exactly why the winner has the highest closeness coefficient.\n"
-        "- Refer to distances to the positive/negative ideal solutions and the "
-        "criterion weights.\n"
-        "- Stay strictly grounded in the math: fuzzy scores, weights, distances, "
-        "and closeness coefficients.\n\n"
+        "Explain step-by-step how the algorithm reached the selected winner. Use numbered steps:\n"
+        "1. **Normalization**: How the raw fuzzy scores were normalized per criterion type "
+        "(Benefit: higher is better, divide by max; Cost: lower is better, flip and scale). "
+        "Mention that values end up in [0, 1].\n"
+        "2. **Weighting**: How each criterion's weight (1–10) was applied to the normalized "
+        "values to get the weighted matrix.\n"
+        "3. **Ideal solutions**: How the Positive Ideal (FPIS) and Negative Ideal (FNIS) "
+        "were determined from the weighted matrix (best and worst value per criterion).\n"
+        "4. **Distances**: How each option's distance to FPIS and to FNIS was computed "
+        "(vertex method: square root of average of squared differences of l, m, u). "
+        "Use the actual distance numbers from the results where available.\n"
+        "5. **Closeness coefficient (CC)**: How CC = distance_to_FNIS / (distance_to_FPIS + "
+        "distance_to_FNIS) for each option; higher CC means closer to the positive ideal.\n"
+        "6. **Why this winner**: Explain concretely why the chosen option has the highest CC "
+        "and is therefore selected (refer to its distances and CC vs. the others).\n"
+        "Stay strictly grounded in the math; use concrete numbers from the provided results.\n\n"
         "## Contextual Fit\n"
         "- Explain how this mathematically winning option fits the user's overall "
         "goal and the criterion descriptions.\n"
@@ -306,8 +399,9 @@ def run_synthesis_llm(
         f"Loser (lowest score, if any): {topsis_result.loser or 'N/A'}\n\n"
         "Write your answer in exactly TWO markdown sections with these headings:\n"
         "## Algorithmic Breakdown\n"
-        "- Focus on distances to the ideal solutions, closeness coefficients, and "
-        "how the weights interact with the fuzzy scores.\n\n"
+        "Use numbered steps (1–6) as in the instructions: normalization, weighting, "
+        "FPIS/FNIS, distances, closeness coefficient, and why this winner was selected. "
+        "Include concrete numbers from the results above where relevant.\n\n"
         "## Contextual Fit\n"
         "- Explain why this mathematically winning option fits the user's stated "
         "overall goal and the criterion descriptions.\n"
