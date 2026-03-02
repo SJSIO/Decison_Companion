@@ -233,7 +233,6 @@ def api_calculate(request):
     Body: { problem_description, options: [...], criteria: [...], scores: [{ option_name, criterion_name, l, m, u, justification }] }
     Returns: { winner, loser, explanation, options: [{ option_name, closeness_coefficient, distance_to_fpis, distance_to_fnis }] }
     """
-    print("this function is called")
     data = _parse_json_body(request)
     if data is None:
         return JsonResponse({"error": "Invalid JSON body."}, status=400)
@@ -255,6 +254,7 @@ def api_calculate(request):
     try:
         topsis_result, explanation, intermediates = run_calculation_and_synthesis(inputs, final_scores)
     except Exception as e:
+        logger.exception("Calculation and synthesis failed")
         return JsonResponse({"error": f"Calculation and synthesis failed: {e}"}, status=500)
 
     options_out = [

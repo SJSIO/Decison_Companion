@@ -638,14 +638,17 @@ def run_synthesis_llm(
     )
 
     try:
-        structured_llm = llm.with_structured_output(SynthesisOutput)
-        result: SynthesisOutput = structured_llm.invoke(
+        response = llm.invoke(
             [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
         )
+        explanation_text = (response.content or "").strip()
+        if not explanation_text:
+            raise RuntimeError("Synthesis LLM returned an empty explanation.")
+        return SynthesisOutput(explanation=explanation_text)
     except ValidationError as ve:
         raise RuntimeError(f"Failed to validate synthesis output: {ve}") from ve
+    except RuntimeError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"Error while calling synthesis LLM: {exc}") from exc
-
-    return result
 

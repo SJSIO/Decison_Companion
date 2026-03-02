@@ -151,7 +151,23 @@ def main():
 
     # Apply a pending reset (triggered from the previous run) *before* any widgets are instantiated.
     if st.session_state.get("_reset_decision_requested"):
-        # Core decision definition (keep counts as-is)
+        prev_num_options = int(st.session_state.get("num_options", 2))
+        prev_num_criteria = int(st.session_state.get("num_criteria", 1))
+
+        # Remove widget-managed keys so Streamlit recreates them fresh.
+        for i in range(prev_num_options):
+            for k in (f"option_name_{i}", f"option_pdf_{i}"):
+                st.session_state.pop(k, None)
+        for i in range(prev_num_criteria):
+            for k in (f"criterion_name_{i}", f"criterion_weight_{i}", f"criterion_desc_{i}"):
+                st.session_state.pop(k, None)
+        st.session_state.pop("overall_goal", None)
+
+        # Reset counts to defaults
+        st.session_state.num_options = 2
+        st.session_state.num_criteria = 1
+
+        # Core decision definition
         st.session_state.problem_description = ""
         st.session_state.options = []
         st.session_state.criteria = []
