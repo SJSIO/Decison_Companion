@@ -564,20 +564,28 @@ def main():
         explanation = result.get("explanation", "")
         options_cc = result.get("options") or []
 
-        if winner:
-            st.success(f"Winner: **{winner}**")
-            st.metric("Recommended option", winner)
+        if options_cc:
+            cc_df = pd.DataFrame(options_cc)
+            cc_df = cc_df.sort_values("closeness_coefficient", ascending=False).reset_index(drop=True)
+            cc_df.index = cc_df.index + 1
+            cc_df.index.name = "Rank"
+
+            st.success(f"Recommended: **{cc_df.iloc[0]['option_name']}** (Rank 1)")
+
+            st.subheader("Rankings")
+            rank_df = cc_df[["option_name", "closeness_coefficient"]].copy()
+            rank_df.columns = ["Option", "Closeness Coefficient"]
+            rank_df["Closeness Coefficient"] = rank_df["Closeness Coefficient"].map(lambda x: f"{x:.4f}")
+            st.table(rank_df)
 
         if explanation:
             st.subheader("Explanation")
-            # Explanation is markdown with two sections: Algorithmic Breakdown & Contextual Fit.
             st.markdown(explanation)
 
         if options_cc:
-            st.subheader("Closeness coefficients")
-            cc_df = pd.DataFrame(options_cc)
-            cc_df = cc_df.sort_values("closeness_coefficient", ascending=False).reset_index(drop=True)
-            st.bar_chart(cc_df.set_index("option_name")["closeness_coefficient"])
+            chart_df = pd.DataFrame(options_cc).sort_values("closeness_coefficient", ascending=False)
+            st.subheader("Score Comparison")
+            st.bar_chart(chart_df.set_index("option_name")["closeness_coefficient"])
 
         st.markdown("---")
         if st.session_state.calculation_intermediates:

@@ -1,6 +1,6 @@
 # Decision Companion
 
-A multi-agent decision-making system that combines AI-driven research with the Fuzzy TOPSIS algorithm to produce ranked, explainable recommendations. Users define options and weighted criteria, optionally upload supporting PDFs, and the system scores, ranks, and explains the best choice.
+A multi-agent decision-making system combining AI research with the Fuzzy TOPSIS algorithm for ranked, explainable recommendations. Users define options and weighted criteria. Crucially, if the LLM lacks the pre-trained knowledge to evaluate the criteria, users can upload custom PDFs to trigger local decision-making—forcing the AI to score, rank, and explain the best choice based strictly on your provided documents.
 
 ## Architecture
 
@@ -19,6 +19,9 @@ Streamlit (Frontend)  ──HTTP──>  Django (Backend API)
   Fuzzy TOPSIS
   (Deterministic Math)
 ```
+
+At first glance, using Django and LangGraph might look like overkill, but it solves a lot of real-world problems.I used django, because it can designed as an api and very easily integrated to any frontend. For the AI side, LangGraph is essential because getting accurate numbers for the Fuzzy TOPSIS math requires more than a simple linear prompt and also to implement RAG it was necessary. Building it as a graph handles the orchestration right now, and it lays the groundwork for a future feature: adding a 'Critic Agent' that can dynamically loop back and fix LLM hallucinations on the fly.
+
 
 **Frontend** — Streamlit multipage app with a five-phase workflow.
 **Backend** — Django REST API exposing `/api/research/` and `/api/calculate/`.
