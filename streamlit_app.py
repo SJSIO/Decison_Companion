@@ -58,7 +58,7 @@ def _reset_decision_state() -> None:
     Keeps num_options and num_criteria so counts are preserved.
     """
     # Defer actual reset until the next run, before widgets are created.
-    # This avoids modifying widget-managed keys (like pdf_uploads) after instantiation.
+    # This avoids modifying widget-managed keys (e.g. option_pdf_{i}) after instantiation.
     st.session_state._reset_decision_requested = True
 
 
@@ -66,11 +66,17 @@ def _api_research(
     problem_description: str,
     options: list,
     criteria: list,
-    documents: list | None = None,
 ) -> dict:
+    """options: list of { name, description?, documents?: [{ filename, content_base64 }] }."""
+    options_payload = []
+    for o in options:
+        opt = {"name": o["name"], "description": o.get("description") or ""}
+        if o.get("documents"):
+            opt["documents"] = o["documents"]
+        options_payload.append(opt)
     payload: dict = {
         "problem_description": problem_description,
-        "options": [{"name": o["name"], "description": o.get("description") or ""} for o in options],
+        "options": options_payload,
         "criteria": [
             {
                 "name": c["name"],
@@ -81,25 +87,6 @@ def _api_research(
             for c in criteria
         ],
     }
-    if documents:
-        payload["documents"] = []
-        for f in documents:
-            # Ensure we always read from the beginning so repeated research
-            # calls in the same session still send full PDF contents.
-            try:
-                f.seek(0)
-            except Exception:
-                # Some UploadedFile-like objects may not support seek; ignore.
-                pass
-            content = f.read()
-            if not content:
-                continue
-            payload["documents"].append(
-                {
-                    "filename": getattr(f, "name", "document.pdf"),
-                    "content_base64": base64.b64encode(content).decode(),
-                }
-            )
 
     r = requests.post(f"{API_BASE_URL}/api/research/", json=payload, timeout=120)
 
@@ -197,20 +184,13 @@ def main():
         height=80,
         placeholder=(
             "Example: We are evaluating three candidates for a Team Lead role. "
-            "I have uploaded their resumes as PDFs. Please evaluate them based on "
+            "I uploaded each candidate's resume under that option's Documents field. "
+            "Please evaluate them based on "
             "Leadership, System Design, and Communication skills."
         ),
         help="Describe what you are trying to decide. This is passed to the AI for research and final explanation.",
     )
     st.session_state.problem_description = problem
-
-    st.file_uploader(
-        "Supporting documents (PDF)",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="pdf_uploads",
-        help="Optional: upload PDFs (e.g. resumes, reports). The AI will base fuzzy scores on retrieved content from these documents.",
-    )
 
     col_counts = st.columns(2)
     with col_counts[0]:
@@ -253,6 +233,7 @@ def main():
     # Dynamic option inputs
     with col_opts:
         st.subheader("Options")
+        st.caption("Attach each candidate's PDF to that option's **Documents (optional)** uploader.")
         for i in range(num_options):
             opt = st.session_state.options[i]
             name_key = f"option_name_{i}"
@@ -262,7 +243,13 @@ def main():
                 key=name_key,
             )
             opt["name"] = name_val.strip()
-            # Basic UI per requirement: only names for options for now.
+            st.file_uploader(
+                f"Documents for Option {i + 1} (optional)",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key=f"option_pdf_{i}",
+                help="Optional: Upload documents specifically for this option. The AI will extract facts from these files to justify its scores, preventing guesswork.",
+            )
 
     # Dynamic criterion inputs
     with col_crits:
@@ -322,13 +309,44 @@ def main():
         with st.spinner("AI agents researching and validating data..."):
             success = False
             try:
-                pdf_uploads = st.session_state.get("pdf_uploads") or []
+                options_with_docs = []
+                for i, o in enumerate(st.session_state.options):
+                    opt = {"name": o["name"], "description": o.get("description") or ""}
+                    files = st.session_state.get(f"option_pdf_{i}") or []
+                    if files:
+                        doc_list = []
+                        for f in files:
+                            try:
+                                f.seek(0)
+                            except Exception:
+                                pass
+                            content = f.read()
+                            if content:
+                                doc_list.append(
+                                    {
+                                        "filename": getattr(f, "name", "document.pdf"),
+                                        "content_base64": base64.b64encode(content).decode(),
+                                    }
+                                )
+                        if doc_list:
+                            opt["documents"] = doc_list
+                    options_with_docs.append(opt)
                 result = _api_research(
                     st.session_state.problem_description,
-                    st.session_state.options,
+                    options_with_docs,
                     st.session_state.criteria,
-                    documents=pdf_uploads if pdf_uploads else None,
                 )
+                if result.get("rag_warning"):
+                    st.warning(result["rag_warning"])
+                else:
+                    uploaded_option_count = sum(
+                        1 for opt in options_with_docs if opt.get("documents")
+                    )
+                    if uploaded_option_count > 0:
+                        st.info(
+                            "RAG is using uploaded PDFs for "
+                            f"{uploaded_option_count} option(s)."
+                        )
                 st.session_state.research_scores = result.get("scores") or []
                 st.session_state.criterion_meta = result.get("criteria") or []
                 # Initialize kinds from LLM guesses (or default to benefit)
@@ -479,24 +497,30 @@ def main():
                         }
                     )
 
-            # Build criteria payload including user-overridden kinds.
+            # Build criteria payload from criterion_meta (research response)
+            # so names match the scores exactly.
             criteria_payload = []
-            for crit in st.session_state.criteria:
-                name = crit["name"]
+            for crit in st.session_state.criterion_meta:
+                name = crit.get("name")
+                if not name:
+                    continue
                 kind_override = st.session_state.criterion_kinds.get(name, crit.get("kind") or "benefit")
                 criteria_payload.append(
                     {
                         "name": name,
-                        "weight": crit["weight"],
+                        "weight": crit.get("weight", 5),
                         "description": crit.get("description") or "",
                         "kind": (kind_override or "benefit").lower(),
                     }
                 )
 
-            # Options payload (names only for now).
+            # Build options payload from score data so names match exactly.
+            option_names_from_scores = list(dict.fromkeys(
+                row["option_name"] for row in scores_payload
+            ))
             options_payload = [
-                {"name": o["name"], "description": o.get("description") or ""}
-                for o in st.session_state.options
+                {"name": n, "description": ""}
+                for n in option_names_from_scores
             ]
 
             with st.spinner("Computing Fuzzy TOPSIS and synthesis..."):
@@ -513,7 +537,7 @@ def main():
                 except requests.RequestException as e:
                     st.error(f"Calculation request failed: {e}")
                 except Exception as e:
-                    st.error(str(e))
+                    st.error(f"Final decision failed: {e}")
             st.rerun()
 
     # ----- Phase 5: Results -----

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 import os
-from typing import List, Literal, Optional
+import re
+from typing import Dict, List, Literal, Optional, Set, Tuple
 
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .models import DecisionInputState, FuzzyTopsisResult, TriangularFuzzyNumber
+
+logger = logging.getLogger(__name__)
 
 
 class StrictBaseModel(BaseModel):
@@ -113,6 +117,151 @@ def get_llm(model_name: str = "llama-3.3-70b-versatile") -> ChatGroq:
     )
 
 
+_SECTION_HEADER_RE = re.compile(
+    r"^\[Context for Option (?P<option_index>\d+) \(.*?\) - Criterion: (?P<criterion>[^\]]+)\]$"
+)
+_CAUTIOUS_PHRASES = (
+    "lack of information",
+    "no information",
+    "not mentioned",
+    "insufficient data",
+)
+_WEAK_TERMS = {
+    "skill",
+    "skills",
+    "ability",
+    "abilities",
+    "criterion",
+    "performance",
+    "general",
+}
+
+
+def _extract_section_map(rag_context: Optional[str]) -> Dict[Tuple[int, str], str]:
+    """
+    Parse RAG context into {(option_index, criterion_name_lower): section_text}.
+    """
+    out: Dict[Tuple[int, str], str] = {}
+    if not rag_context or not rag_context.strip():
+        return out
+    for part in rag_context.split("\n\n---\n\n"):
+        if not part.strip():
+            continue
+        lines = part.split("\n", 1)
+        header = lines[0].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
+        m = _SECTION_HEADER_RE.match(header)
+        if not m:
+            logger.debug("RAG section header did not match regex: %s", header)
+            continue
+        out[(int(m.group("option_index")), m.group("criterion").strip().lower())] = body
+    logger.debug("Parsed %d RAG sections from context", len(out))
+    return out
+
+
+def _criterion_terms(criterion_name: str, criterion_description: Optional[str]) -> Set[str]:
+    """Extract search terms from criterion name/description, including truncated
+    stems (first 6 chars of words with 6+ chars) for broader matching."""
+    terms: Set[str] = set()
+    full_name = (criterion_name or "").strip().lower()
+    if full_name:
+        terms.add(full_name)
+    combined = f"{criterion_name or ''} {criterion_description or ''}".lower()
+    for tok in re.findall(r"[a-zA-Z]{4,}", combined):
+        if tok in _WEAK_TERMS:
+            continue
+        terms.add(tok)
+        if len(tok) >= 6:
+            terms.add(tok[:6])
+    return terms
+
+
+def _count_matching_terms(section_text: str, terms: Set[str]) -> int:
+    """Return how many distinct terms from *terms* appear in section_text."""
+    if not section_text.strip():
+        return 0
+    lower = section_text.lower()
+    return sum(1 for t in terms if t in lower)
+
+
+def _section_has_direct_evidence(section_text: str, terms: Set[str]) -> bool:
+    if not section_text.strip():
+        return False
+    lower = section_text.lower()
+    if "no uploaded document for this option." in lower:
+        return False
+    if "(no chunks retrieved for this option and criterion.)" in lower:
+        return False
+    return any(t in lower for t in terms)
+
+
+def _pick_evidence_snippet(section_text: str, terms: Set[str]) -> str:
+    for line in section_text.splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        lower = clean.lower()
+        if any(t in lower for t in terms):
+            return clean[:180]
+    return section_text.strip().splitlines()[0][:180] if section_text.strip() else "relevant evidence"
+
+
+def _contains_cautious_phrase(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(p in lower for p in _CAUTIOUS_PHRASES)
+
+
+def _annotate_rag_context(
+    rag_context: str,
+    criteria: List,
+) -> str:
+    """Prepend keyword-match markers to each RAG section so the LLM cannot
+    overlook evidence.  Returns the annotated context string."""
+    if not rag_context or not rag_context.strip():
+        return rag_context
+
+    criteria_terms_by_name: Dict[str, Set[str]] = {}
+    for crit in criteria:
+        cname = (crit.name if hasattr(crit, "name") else crit.get("name", "")).strip().lower()
+        cdesc = (crit.description if hasattr(crit, "description") else crit.get("description")) or ""
+        if cname:
+            criteria_terms_by_name[cname] = _criterion_terms(cname, cdesc)
+
+    annotated_parts: List[str] = []
+    for part in rag_context.split("\n\n---\n\n"):
+        if not part.strip():
+            annotated_parts.append(part)
+            continue
+        lines = part.split("\n", 1)
+        header = lines[0].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
+
+        m = _SECTION_HEADER_RE.match(header)
+        if not m or not body:
+            annotated_parts.append(part)
+            continue
+
+        crit_key = m.group("criterion").strip().lower()
+        terms = criteria_terms_by_name.get(crit_key, set())
+        if not terms:
+            annotated_parts.append(part)
+            continue
+
+        lower_body = body.lower()
+        matched = sorted(t for t in terms if t in lower_body)
+        if matched:
+            marker = (
+                f'>>> KEYWORD MATCH: {", ".join(repr(t) for t in matched)} '
+                "found in this section. This is strong evidence for this "
+                "criterion — score accordingly.\n"
+            )
+            annotated_parts.append(f"{header}\n{marker}{body}")
+        else:
+            annotated_parts.append(part)
+
+    return "\n\n---\n\n".join(annotated_parts)
+
+
 def run_research_llm(
     decision_input: DecisionInputState,
     rag_context: Optional[str] = None,
@@ -127,35 +276,43 @@ def run_research_llm(
     llm = get_llm()
 
     system_prompt = (
-        "You are an Expert Analyst and Strategic Decision Consultant. Your job is to objectively "
-        "evaluate specific options based on provided documentation and your broad industry knowledge. "
-        "You work in any domain: vendor contracts, candidates, products, strategies, or any other "
-        "decision with options and criteria. For each (option, criterion) pair, use the option name, "
-        "the criterion name, and the USER'S DEFINITION of that criterion (provided in the task). "
-        "Score strictly according to what the user means by that criterion.\n\n"
-        "INSTRUCTIONS AND RULES:\n"
-        "1. DEDUCE AND INFER: Documents rarely state perfect answers explicitly. You are STRICTLY "
-        "FORBIDDEN from outputting \"not known\", \"not mentioned\", \"insufficient data\", \"lack of "
-        "description\", or \"not explicitly mentioned\". You MUST use your expert knowledge to infer "
-        "how well this option performs based on the provided context.\n"
-        "   - Example: If evaluating a software tool for \"Security\" and the context mentions "
-        "\"SOC2 compliance and end-to-end encryption\", infer a high score even if the word "
-        "\"Security\" is not explicitly written.\n"
-        "   - Example: If the criterion is \"Cost\" and the user's definition is \"Lowest long-term "
-        "maintenance fee\", score based on maintenance-related evidence, not just upfront price.\n"
-        "2. TRIANGULAR FUZZY SCORING: Output a Triangular Fuzzy Number (l, m, u) on a scale of 1 to 10. "
-        "lower_bound (l) = worst-case / most pessimistic; most_likely (m) = most realistic; "
-        "upper_bound (u) = best-case / most optimistic. Require l <= m <= u.\n"
-        "3. SPARSE CONTEXT: If the context is truly sparse for an option, infer a reasonable baseline "
-        "based on the nature of the option and the criterion, and widen your confidence range "
-        "(e.g. output a broader triangle like 3, 5, 8). Do not default to the middle; commit to a "
-        "plausible range.\n"
-        "4. JUSTIFICATION: Provide a 1–2 sentence justification that references the provided text "
-        "or your logical deduction. For extracted_evidence, use 1–2 exact phrases from the context "
-        "when available; if inferring from thin context, briefly state the inference basis.\n\n"
-        "OUTPUT: Return one item per (option_index, criterion_index) with extracted_evidence, "
-        "lower_bound, most_likely, upper_bound, and justification. Never refuse to score; always "
-        "produce a defensible fuzzy score and justification.\n"
+        "You are a highly perceptive Expert Analyst and Evaluator. Your job is to score options "
+        "based on provided text. You are evaluating every (option, criterion) pair. For each pair "
+        "use the option name, the criterion name, and the User's Definition of that criterion "
+        "(provided below). The provided context is grouped by option; use ONLY the section for "
+        "that option when scoring that option.\n\n"
+        "CRITICAL RULES - READ CAREFULLY:\n"
+        "1. EXPLICIT AUTHORIZATION TO INFER: You are STRICTLY FORBIDDEN from outputting \"not known\", "
+        "\"implies average\", or \"insufficient data\". Resumes and contracts rarely state soft skills "
+        "directly. You MUST use your expert industry knowledge to infer the option's proficiency "
+        "based on projects, roles, and achievements.\n"
+        "2. MANDATORY PROXY MAPPING (EXAMPLES):\n"
+        "   - If evaluating 'Communication' and the context mentions roles like \"Public Relations "
+        "Core Member\" or coordinating media events, you MUST score them very high.\n"
+        "   - If evaluating 'Technical Skills' and the context mentions completing an \"NPTEL online "
+        "course\" on algorithms or building complex RAG pipelines, you MUST infer a solid technical "
+        "baseline and score them high.\n"
+        "3. BENEFIT OF THE DOUBT: Do not default to the middle. If you see evidence of teamwork, "
+        "complex system design, or leadership, aggressively reward it in your fuzzy scores.\n"
+        "4. MISSING DATA FALLBACK: If the context block for an option is completely empty (no files "
+        "uploaded), you must use your broad industry knowledge regarding that option name to infer "
+        "a reasonable score. Do NOT crash or output \"not known\".\n"
+        "5. CONTEXT CONTAINS EVIDENCE: If the context section for this option and criterion contains "
+        "the criterion name, obvious synonyms, or related phrases (e.g. \"communication skills\", "
+        "\"communication\", \"presentations\", \"client relations\"), you MUST use that as extracted_evidence "
+        "and assign HIGHER fuzzy scores. You are STRICTLY FORBIDDEN from saying \"lack of information\", "
+        "\"no information\", or \"not mentioned\" when the context block for that option and criterion "
+        "actually contains such text. Read the context section carefully before scoring.\n"
+        "6. FILE CONTENT WEIGHT: When an option has uploaded file context (non-empty section), you MUST "
+        "heavily weight that content for scoring. If ANY keyword or phrase in the uploaded file matches "
+        "or relates to the criterion (e.g. criterion is 'Communication' and the file mentions "
+        "\"communication\", \"communication skills\", \"presented\", \"spoke\", \"wrote\"), assign a HIGHER "
+        "fuzzy score (typically most_likely >= 7). Keyword match in the file is strong evidence; reward it.\n\n"
+        "OUTPUT SCHEMA (CHAIN OF THOUGHT): You must think step-by-step. Return one JSON object per "
+        "(option_index, criterion_index) with: extracted_evidence (1-2 exact phrases or proxy "
+        "concepts from the context that relate to the criterion), lower_bound, most_likely, "
+        "upper_bound (floats 1-10, l <= m <= u), and justification (explain how the extracted "
+        "evidence proves capability; do NOT say the information is missing).\n"
     )
 
     # Flatten options and criteria into an explicit, index-based description
@@ -176,50 +333,54 @@ def run_research_llm(
         )
     criteria_block = "\n".join(criteria_block_lines)
 
+    # Annotate RAG sections with keyword-match markers before the LLM sees them.
+    annotated_context = _annotate_rag_context(rag_context, decision_input.criteria) if rag_context else rag_context
+
     user_prompt = (
         f"Decision problem:\n{decision_input.problem_description}\n\n"
         f"Options (indexed by option_index):\n{options_block}\n\n"
         f"Criteria (indexed by criterion_index):\n{criteria_block}\n\n"
     )
-    if rag_context and rag_context.strip():
+    if annotated_context and annotated_context.strip():
         user_prompt += (
-            "Here is the factual context retrieved from the user's uploaded documents:\n"
+            "Provided Context (from uploaded files):\n"
             "<context>\n"
-            f"{rag_context.strip()}\n"
+            f"{annotated_context.strip()}\n"
             "</context>\n\n"
-            "Score like an objective evaluator: for each criterion, options with clear supporting "
-            "evidence in the context must receive higher fuzzy scores (l, m, u); options with no or "
-            "weak evidence must receive lower scores. Use the User's Definition of each criterion to "
-            "decide what counts as evidence.\n\n"
-            "If the context is grouped by 'Context for Option 0', 'Context for Option 1', etc., use "
-            "only the section for that option when scoring that option — do not use another option's "
-            "context.\n\n"
+            "Context sections are labeled [Context for Option i (name) - Criterion: criterion_name]. "
+            "When scoring option_index i and criterion_index j, use ONLY the section for Option i "
+            "and Criterion j. HEAVILY WEIGHT the contents of the uploaded file: if ANY keyword or "
+            "phrase in that section matches or relates to the criterion (e.g. criterion 'Communication' "
+            "and file contains 'communication', 'communication skills', 'presentations'), you MUST quote "
+            "it in extracted_evidence and assign HIGHER fuzzy scores (most_likely >= 7). Even a single "
+            "keyword match in the file is strong evidence — reward it. Never say 'lack of information' "
+            "when the context contains such a match. Options with no or weak evidence in that section "
+            "must receive lower scores.\n\n"
         )
     user_prompt += (
         "You MUST create one item for EVERY possible combination of option_index and criterion_index. "
-        "For each item return:\n"
+        "Think step-by-step. For each item return a JSON object with:\n"
         "- option_index (integer)\n"
         "- criterion_index (integer)\n"
-        "- extracted_evidence: 1–2 exact phrases or concepts from the context that relate to the "
-        "criterion; if context is sparse, state the inference basis in a short phrase (e.g. \"Inferred "
-        "from SLA and uptime guarantees\")\n"
-        "- lower_bound: float 1–10 (worst-case)\n"
-        "- most_likely: float 1–10 (most realistic)\n"
-        "- upper_bound: float 1–10 (best-case); must have lower_bound <= most_likely <= upper_bound\n"
-        "- justification: 1–2 sentences that reference the provided text or your logical deduction. "
-        "Do NOT say the information is missing or unknown.\n\n"
+        "- extracted_evidence: List 1-2 exact phrases or proxy concepts from the context that "
+        "relate to the criterion.\n"
+        "- lower_bound: float 1-10 (worst-case)\n"
+        "- most_likely: float 1-10 (most realistic)\n"
+        "- upper_bound: float 1-10 (best-case); lower_bound <= most_likely <= upper_bound\n"
+        "- justification: Explain how the extracted evidence proves their capability. Do NOT say "
+        "the information is missing.\n\n"
         "Example item:\n"
         "{\n"
         '  \"option_index\": 0,\n'
         '  \"criterion_index\": 1,\n'
-        '  \"extracted_evidence\": \"SOC2 Type II; encryption at rest and in transit\",\n'
+        '  \"extracted_evidence\": \"Public Relations Core Member; coordinated media events\",\n'
         '  \"lower_bound\": 7.0,\n'
         '  \"most_likely\": 8.5,\n'
         '  \"upper_bound\": 9.0,\n'
-        '  \"justification\": \"Compliance and encryption signals strongly support a high security score.\"\n'
+        '  \"justification\": \"PR role and media coordination demonstrate strong communication.\"\n'
         "}\n\n"
-        "Do NOT omit any combinations. Do NOT output \"not known\", \"not mentioned\", \"insufficient "
-        "data\", or \"lack of description\". Always produce a defensible score and justification.\n"
+        "Do NOT omit any combinations. Do NOT output \"not known\", \"implies average\", or "
+        "\"insufficient data\". Always produce a defensible score and justification.\n"
     )
 
     try:
@@ -233,26 +394,93 @@ def run_research_llm(
         raise RuntimeError(f"Error while calling research LLM: {exc}") from exc
 
     # Convert LLM output (extracted_evidence, lower_bound, most_likely, upper_bound) to pipeline
-    # format (score as TriangularFuzzyNumber, justification). Optionally fold extracted_evidence
-    # into justification so the user sees it.
+    # format (score as TriangularFuzzyNumber, justification).
+    section_map = _extract_section_map(rag_context)
+    evidence_flags: Dict[Tuple[int, int], bool] = {}
     items: List[OptionCriterionAIResearch] = []
     for raw in raw_result.items or []:
+        lower_bound = raw.lower_bound
+        most_likely = raw.most_likely
+        upper_bound = raw.upper_bound
+        justification = raw.justification.strip()
+
+        # Deterministic guardrail: if retrieved section contains criterion evidence,
+        # force evidence-led justification and avoid cautious/low scoring drift.
+        # Uses tiered boosting: strong evidence (2+ term matches) gets higher floors.
+        has_evidence = False
+        if (
+            0 <= raw.option_index < len(decision_input.options)
+            and 0 <= raw.criterion_index < len(decision_input.criteria)
+        ):
+            crit = decision_input.criteria[raw.criterion_index]
+            section_text = section_map.get(
+                (raw.option_index, crit.name.strip().lower()),
+                "",
+            )
+            terms = _criterion_terms(crit.name, crit.description)
+            if _section_has_direct_evidence(section_text, terms):
+                has_evidence = True
+                match_count = _count_matching_terms(section_text, terms)
+                if match_count >= 2:
+                    lower_bound = max(lower_bound, 7.0)
+                    most_likely = max(most_likely, 8.0)
+                    upper_bound = max(upper_bound, 9.0)
+                else:
+                    lower_bound = max(lower_bound, 6.0)
+                    most_likely = max(most_likely, 7.0)
+                    upper_bound = max(upper_bound, 8.0)
+                snippet = _pick_evidence_snippet(section_text, terms)
+                needs_rewrite = (
+                    _contains_cautious_phrase(justification)
+                    or not any(t in justification.lower() for t in terms)
+                )
+                if needs_rewrite:
+                    justification = (
+                        f'Uploaded document evidence includes "{snippet}", '
+                        f"which directly supports stronger {crit.name.lower()} and "
+                        "justifies a higher fuzzy score."
+                    )
+                # Preserve TFN ordering after enforced floors.
+                most_likely = max(most_likely, lower_bound)
+                upper_bound = max(upper_bound, most_likely)
+                lower_bound = min(lower_bound, 10.0)
+                most_likely = min(most_likely, 10.0)
+                upper_bound = min(upper_bound, 10.0)
+
+        evidence_flags[(raw.option_index, raw.criterion_index)] = has_evidence
         score_tfn = TriangularFuzzyNumber(
-            l=raw.lower_bound,
-            m=raw.most_likely,
-            u=raw.upper_bound,
+            l=lower_bound,
+            m=most_likely,
+            u=upper_bound,
         )
-        justification = raw.justification
-        if raw.extracted_evidence.strip():
-            justification = f"[Evidence: {raw.extracted_evidence.strip()}] {justification}"
         items.append(
             OptionCriterionAIResearch(
                 option_index=raw.option_index,
                 criterion_index=raw.criterion_index,
                 score=score_tfn,
-                justification=justification.strip(),
+                justification=justification,
             )
         )
+
+    # Comparative post-processing: for each criterion, if some options have
+    # direct evidence and others do not, ensure evidence-bearing options outscore
+    # non-evidence options by at least 1.0 on m.
+    for crit_idx in range(len(decision_input.criteria)):
+        crit_items_with = [it for it in items if it.criterion_index == crit_idx and evidence_flags.get((it.option_index, crit_idx))]
+        crit_items_without = [it for it in items if it.criterion_index == crit_idx and not evidence_flags.get((it.option_index, crit_idx))]
+        if crit_items_with and crit_items_without:
+            max_no_evidence_m = max(it.score.m for it in crit_items_without)
+            required_min_m = min(max_no_evidence_m + 1.0, 10.0)
+            for it in crit_items_with:
+                if it.score.m < required_min_m:
+                    gap = required_min_m - it.score.m
+                    new_l = min(it.score.l + gap, 10.0)
+                    new_m = min(it.score.m + gap, 10.0)
+                    new_u = min(it.score.u + gap, 10.0)
+                    new_m = max(new_m, new_l)
+                    new_u = max(new_u, new_m)
+                    it.score = TriangularFuzzyNumber(l=new_l, m=new_m, u=new_u)
+
     result = ResearchBatchOutput(items=items)
 
     # Additional safety: ensure we have exactly one item per (option, criterion)
@@ -265,7 +493,7 @@ def run_research_llm(
             f"(number_of_options x number_of_criteria)."
         )
 
-    seen_pairs = set()
+    seen_pairs: set = set()
     for item in items:
         if not (0 <= item.option_index < len(decision_input.options)):
             raise RuntimeError(f"AI returned invalid option_index {item.option_index}.")

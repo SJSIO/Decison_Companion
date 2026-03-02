@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from typing import Any, Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -102,7 +105,7 @@ def _scores_list_to_final_scores(
 def api_research(request):
     """
     POST /api/research/
-    Body: { problem_description, options: [{name, description?}], criteria: [{name, weight, description?, kind?}] }
+    Body: { problem_description, options: [{name, description?, documents?: [{filename, content_base64}]}], criteria: [...] }
     Returns:
       {
         "scores": [{ option_name, criterion_name, l, m, u, justification }],
@@ -130,12 +133,14 @@ def api_research(request):
         for item in nature_batch.items:
             nature_by_name[item.criterion_name] = item
 
-        # Optional RAG: parse documents (PDFs as base64), build context, pass to research.
+        # Optional RAG: parse documents per option (PDFs as base64), build context, pass to research.
         rag_context = ""
-        documents_raw = data.get("documents") or []
-        if documents_raw:
-            docs_list: List[Tuple[str, bytes]] = []
-            for item in documents_raw:
+        options_data = data.get("options") or []
+        documents_per_option: List[List[Tuple[str, bytes]]] = []
+        for i in range(len(inputs.options)):
+            opt_data = options_data[i] if i < len(options_data) else {}
+            doc_list: List[Tuple[str, bytes]] = []
+            for item in opt_data.get("documents") or []:
                 if not isinstance(item, dict):
                     continue
                 name = item.get("filename") or "document.pdf"
@@ -145,28 +150,34 @@ def api_research(request):
                 try:
                     doc_bytes = base64.b64decode(b64)
                     if doc_bytes:
-                        docs_list.append((name, doc_bytes))
+                        doc_list.append((name, doc_bytes))
                 except Exception:
                     continue
-            if docs_list:
-                try:
-                    rag_context = build_rag_context(
-                        docs_list,
-                        inputs.options,
-                        inputs.criteria,
-                        inputs.problem_description,
-                    )
-                except Exception:
-                    # If RAG fails for any reason (e.g., PDF parsing or embedding issues),
-                    # fall back to running AI research without document context instead
-                    # of failing the entire request.
-                    rag_context = ""
+            documents_per_option.append(doc_list)
+        try:
+            rag_context = build_rag_context(
+                documents_per_option,
+                inputs.options,
+                inputs.criteria,
+                inputs.problem_description,
+            )
+        except Exception as e:
+            logger.exception("RAG context build failed: %s", e)
+            rag_context = ""
 
         # Run AI research to get fuzzy scores (with optional RAG context).
         try:
             ai_result = run_ai_research(inputs, rag_context=rag_context or None)
         except Exception as e:
             return JsonResponse({"error": f"AI research failed: {e}"}, status=500)
+
+        # If user uploaded docs but RAG produced no context, add a warning so UI can inform them.
+        had_docs = any(doc_list for doc_list in documents_per_option)
+        rag_warning = (
+            "PDF context could not be generated; scores may not reflect uploaded documents."
+            if (had_docs and not (rag_context and rag_context.strip()))
+            else None
+        )
 
         # Serialize scores to a list (JSON does not support tuple keys).
         scores_list = []
@@ -201,7 +212,10 @@ def api_research(request):
                 }
             )
 
-        return JsonResponse({"scores": scores_list, "criteria": criteria_list})
+        payload = {"scores": scores_list, "criteria": criteria_list}
+        if rag_warning:
+            payload["rag_warning"] = rag_warning
+        return JsonResponse(payload)
     except Exception as e:
         # Last-resort guard: surface unexpected errors as structured JSON
         # instead of a generic HTML 500 page.

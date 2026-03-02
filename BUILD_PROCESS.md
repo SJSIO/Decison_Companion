@@ -154,3 +154,16 @@ That is a real-world system failure. Recommending a laptop with a 30-minute batt
 
 So I thought of changing the core algoritham and started researching for it
 
+---
+
+##### RAG and local embeddings (optional env)
+
+When users upload PDFs, the app uses a local Hugging Face embedding model (via `sentence-transformers`) for vector search. The first request that uses PDFs may be slower while the model is downloaded from Hugging Face (e.g. ~90MB for the default model).
+
+Optional environment variables:
+
+- **RAG_EMBEDDING_MODEL** – Hugging Face model id (default: `all-MiniLM-L6-v2`). For higher quality, e.g. `all-mpnet-base-v2`.
+- **RAG_EMBEDDING_DEVICE** – `cpu` or `cuda` (default: `cpu`).
+
+If `sentence-transformers` is not installed or the model fails to load, the app falls back to a simple bag-of-words embedding so RAG still runs.
+
